@@ -105,6 +105,60 @@ pub fn copy_scheme(app: &AppHandle, id: &str) -> Result<Pipeline, String> {
     save_scheme(app, pipeline)
 }
 
+/// Write a scheme JSON to an arbitrary path (for backup / sharing).
+pub fn export_scheme(app: &AppHandle, id: &str, output_path: &str) -> Result<String, String> {
+    let pipeline = load_scheme(app, id)?;
+    let path = PathBuf::from(output_path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    let json = serde_json::to_string_pretty(&pipeline).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(path.display().to_string())
+}
+
+/// Export an in-memory pipeline (e.g. current unsaved edits) to a path.
+pub fn export_pipeline(pipeline: &Pipeline, output_path: &str) -> Result<String, String> {
+    let path = PathBuf::from(output_path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+    let json = serde_json::to_string_pretty(pipeline).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(path.display().to_string())
+}
+
+/// Import a scheme JSON file into app storage (new id; unique name).
+pub fn import_scheme(app: &AppHandle, input_path: &str) -> Result<Pipeline, String> {
+    let text = fs::read_to_string(input_path).map_err(|e| format!("读取失败: {e}"))?;
+    let mut pipeline: Pipeline =
+        serde_json::from_str(&text).map_err(|e| format!("不是有效的方案文件: {e}"))?;
+    let existing: Vec<String> = list_schemes(app)?.into_iter().map(|s| s.name).collect();
+    pipeline.id = Uuid::new_v4().to_string();
+    if pipeline.name.trim().is_empty() {
+        pipeline.name = "导入方案".into();
+    }
+    if existing.iter().any(|n| n == &pipeline.name) {
+        pipeline.name = unique_import_name(&pipeline.name, &existing);
+    }
+    save_scheme(app, pipeline)
+}
+
+fn unique_import_name(original: &str, existing: &[String]) -> String {
+    let mut n = 2usize;
+    loop {
+        let candidate = format!("{original} ({n})");
+        if !existing.iter().any(|name| name == &candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 fn unique_copy_name(original: &str, existing: &[String]) -> String {
     let base = format!("{original} 副本");
     if !existing.iter().any(|n| n == &base) {

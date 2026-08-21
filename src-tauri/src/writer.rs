@@ -219,6 +219,8 @@ pub fn write_formula_template(
     sources: &[(String, &DataTable)],
     filter_sheet: Option<FilterTemplate>,
     pivot_sheet: Option<PivotTemplate>,
+    calculate_sheet: Option<CalculateTemplate>,
+    sort_sheets: &[SortTemplate],
     new_premium_sheet: Option<NewPremiumTemplate>,
 ) -> Result<(), String> {
     let mut workbook = Workbook::new();
@@ -228,6 +230,8 @@ pub fn write_formula_template(
         Data(&'a str, &'a DataTable),
         Filter(FilterTemplate),
         Pivot(PivotTemplate),
+        Calculate(CalculateTemplate),
+        Sort(SortTemplate),
         NewPremium(NewPremiumTemplate),
     }
 
@@ -240,6 +244,13 @@ pub fn write_formula_template(
     }
     if let Some(pt) = pivot_sheet {
         pending.push(PendingSheet::Pivot(pt));
+    }
+    // Calculate before sort so dependency order is clear in the builder list
+    if let Some(ct) = calculate_sheet {
+        pending.push(PendingSheet::Calculate(ct));
+    }
+    for st in sort_sheets {
+        pending.push(PendingSheet::Sort(st.clone()));
     }
     if let Some(np) = new_premium_sheet {
         pending.push(PendingSheet::NewPremium(np));
@@ -269,6 +280,20 @@ pub fn write_formula_template(
                     .map_err(|e| e.to_string())?;
                 write_pivot_formulas(ws, &pt)?;
             }
+            PendingSheet::Calculate(ct) => {
+                let ws = workbook
+                    .add_worksheet()
+                    .set_name(sanitize_sheet_name(&ct.sheet_name))
+                    .map_err(|e| e.to_string())?;
+                write_calculate_formulas(ws, &ct)?;
+            }
+            PendingSheet::Sort(st) => {
+                let ws = workbook
+                    .add_worksheet()
+                    .set_name(sanitize_sheet_name(&st.sheet_name))
+                    .map_err(|e| e.to_string())?;
+                write_sort_formulas(ws, &st)?;
+            }
             PendingSheet::NewPremium(np) => {
                 let ws = workbook
                     .add_worksheet()
@@ -297,6 +322,34 @@ pub struct PivotTemplate {
     pub row_fields: Vec<String>,
     pub value_field: String,
     pub filtered_headers: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct SortTemplate {
+    pub sheet_name: String,
+    /// Excel sheet name of the table being sorted (already final name).
+    pub source_sheet: String,
+    pub headers: Vec<String>,
+    /// (column name, descending)
+    pub keys: Vec<(String, bool)>,
+}
+
+pub struct CalcJoinTemplate {
+    pub table_id: String,
+    pub sheet_name: String,
+    pub base_key: String,
+    pub foreign_key: String,
+    pub headers: Vec<String>,
+}
+
+pub struct CalculateTemplate {
+    pub sheet_name: String,
+    pub base_sheet: String,
+    pub base_table_id: String,
+    pub base_headers: Vec<String>,
+    pub output_field: String,
+    pub formula: String,
+    pub joins: Vec<CalcJoinTemplate>,
 }
 
 pub struct NewPremiumTemplate {
@@ -399,16 +452,24 @@ fn write_pivot_formulas(ws: &mut Worksheet, pt: &PivotTemplate) -> Result<(), St
         return Err("透视行字段在筛选结果表头中未找到".into());
     }
 
+    // Data starts at row 2 on the filtered sheet (row 1 is header) — do not include
+    // the header in UNIQUE/SUMIF or it spills as a second header row.
+    const DATA_END: &str = "100000";
+
     // Spill UNIQUE of key columns
     if key_idxs.len() == 1 {
         let cl = col_letter(key_idxs[0]);
-        let formula = format!("=UNIQUE(FILTER('{filtered}'!{cl}:{cl},'{filtered}'!{cl}:{cl}<>\"\"))");
+        let formula = format!(
+            "=UNIQUE(FILTER('{filtered}'!{cl}2:{cl}{DATA_END},'{filtered}'!{cl}2:{cl}{DATA_END}<>\"\"))"
+        );
         ws.write_formula(1, 0, Formula::new(formula))
             .map_err(|e| e.to_string())?;
     } else {
         // Use CHOOSECOLS + UNIQUE on filtered body — simplified: UNIQUE of first col, XLOOKUP others
         let cl = col_letter(key_idxs[0]);
-        let formula = format!("=UNIQUE(FILTER('{filtered}'!{cl}:{cl},'{filtered}'!{cl}:{cl}<>\"\"))");
+        let formula = format!(
+            "=UNIQUE(FILTER('{filtered}'!{cl}2:{cl}{DATA_END},'{filtered}'!{cl}2:{cl}{DATA_END}<>\"\"))"
+        );
         ws.write_formula(1, 0, Formula::new(formula))
             .map_err(|e| e.to_string())?;
         for (i, &idx) in key_idxs.iter().enumerate().skip(1) {
@@ -416,7 +477,7 @@ fn write_pivot_formulas(ws: &mut Worksheet, pt: &PivotTemplate) -> Result<(), St
             let kcl = col_letter(key_idxs[0]);
             // For each unique key in A, lookup first matching other field
             let formula = format!(
-                "=MAP(A2#,LAMBDA(k,XLOOKUP(k,'{filtered}'!{kcl}:{kcl},'{filtered}'!{rcl}:{rcl},\"\")))"
+                "=MAP(A2#,LAMBDA(k,XLOOKUP(k,'{filtered}'!{kcl}2:{kcl}{DATA_END},'{filtered}'!{rcl}2:{rcl}{DATA_END},\"\")))"
             );
             ws.write_formula(1, i as u16, Formula::new(formula))
                 .map_err(|e| e.to_string())?;
@@ -428,13 +489,155 @@ fn write_pivot_formulas(ws: &mut Worksheet, pt: &PivotTemplate) -> Result<(), St
         let kcl = col_letter(key_idxs[0]);
         let col = pt.row_fields.len() as u16;
         let formula = format!(
-            "=MAP(A2#,LAMBDA(k,SUMIF('{filtered}'!{kcl}:{kcl},k,'{filtered}'!{vcl}:{vcl})))"
+            "=MAP(A2#,LAMBDA(k,SUMIF('{filtered}'!{kcl}2:{kcl}{DATA_END},k,'{filtered}'!{vcl}2:{vcl}{DATA_END})))"
         );
         ws.write_formula(1, col, Formula::new(formula))
             .map_err(|e| e.to_string())?;
     }
 
     Ok(())
+}
+
+fn write_sort_formulas(ws: &mut Worksheet, st: &SortTemplate) -> Result<(), String> {
+    let src = sanitize_sheet_name(&st.source_sheet);
+    let header_fmt = header_format();
+    for (c, h) in st.headers.iter().enumerate() {
+        ws.write_with_format(0, c as u16, h.as_str(), &header_fmt)
+            .map_err(|e| e.to_string())?;
+    }
+    if st.headers.is_empty() {
+        return Ok(());
+    }
+    if st.keys.is_empty() {
+        return Err("排序步骤缺少排序字段".into());
+    }
+
+    const DATA_END: &str = "100000";
+    let end_col = col_letter(st.headers.len() - 1);
+    let data_expr = format!(
+        "FILTER('{src}'!A2:{end_col}{DATA_END},'{src}'!A2:A{DATA_END}<>\"\")"
+    );
+
+    let mut sort_args = Vec::new();
+    for (col, desc) in &st.keys {
+        let Some(idx) = st.headers.iter().position(|h| h == col) else {
+            return Err(format!("排序字段「{col}」不在表头中"));
+        };
+        let order = if *desc { -1 } else { 1 };
+        // SORTBY(array, by_col, order, ...) — by_col via INDEX on the filtered body
+        sort_args.push(format!("INDEX(data,,{}),{}", idx + 1, order));
+    }
+    if sort_args.is_empty() {
+        return Err("排序步骤没有有效的排序字段".into());
+    }
+
+    let formula = format!("=LET(data,{data_expr},SORTBY(data,{}))", sort_args.join(","));
+    ws.write_formula(1, 0, Formula::new(formula))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn write_calculate_formulas(ws: &mut Worksheet, ct: &CalculateTemplate) -> Result<(), String> {
+    let base_sheet = sanitize_sheet_name(&ct.base_sheet);
+    let header_fmt = header_format();
+    let mut headers = ct.base_headers.clone();
+    headers.push(ct.output_field.clone());
+    for (c, h) in headers.iter().enumerate() {
+        ws.write_with_format(0, c as u16, h.as_str(), &header_fmt)
+            .map_err(|e| e.to_string())?;
+    }
+    if ct.base_headers.is_empty() {
+        return Ok(());
+    }
+
+    const DATA_END: &str = "100000";
+    let end_col = col_letter(ct.base_headers.len() - 1);
+    let row_expr = formula_refs_to_excel(
+        &ct.formula,
+        &ct.base_table_id,
+        &ct.base_headers,
+        &ct.joins,
+    )?;
+
+    let formula = format!(
+        "=LET(base,FILTER('{base_sheet}'!A2:{end_col}{DATA_END},'{base_sheet}'!A2:A{DATA_END}<>\"\"),HSTACK(base,MAP(SEQUENCE(ROWS(base)),LAMBDA(i,{row_expr}))))"
+    );
+    ws.write_formula(1, 0, Formula::new(formula))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Convert `[tableId!col]` / `[col]` formula refs into Excel expressions for row `i` of `base`.
+fn formula_refs_to_excel(
+    formula: &str,
+    base_table_id: &str,
+    base_headers: &[String],
+    joins: &[CalcJoinTemplate],
+) -> Result<String, String> {
+    let expr = formula.trim().trim_start_matches('=').trim();
+    if expr.is_empty() {
+        return Err("计算公式不能为空".into());
+    }
+    let mut out = String::new();
+    let mut rest = expr;
+    while let Some(start) = rest.find('[') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let end = after
+            .find(']')
+            .ok_or_else(|| format!("公式括号未闭合: {formula}"))?;
+        let inside = after[..end].trim();
+        let piece = if let Some((tid, col)) = inside.split_once('!') {
+            let tid = tid.trim();
+            let col = col.trim();
+            if tid == base_table_id {
+                let idx = base_headers
+                    .iter()
+                    .position(|h| h == col)
+                    .ok_or_else(|| format!("基准表缺少列「{col}」"))?
+                    + 1;
+                format!("INDEX(base,i,{idx})")
+            } else {
+                let join = joins
+                    .iter()
+                    .find(|j| j.table_id == tid)
+                    .ok_or_else(|| format!("公式引用了未关联的表「{tid}」"))?;
+                let sheet = sanitize_sheet_name(&join.sheet_name);
+                let bk = base_headers
+                    .iter()
+                    .position(|h| h == &join.base_key)
+                    .ok_or_else(|| format!("关联键「{}」不在基准表", join.base_key))?
+                    + 1;
+                let fk = join
+                    .headers
+                    .iter()
+                    .position(|h| h == &join.foreign_key)
+                    .ok_or_else(|| format!("关联键「{}」不在表「{tid}」", join.foreign_key))?;
+                let vk = join
+                    .headers
+                    .iter()
+                    .position(|h| h == col)
+                    .ok_or_else(|| format!("表「{tid}」缺少列「{col}」"))?;
+                let fcl = col_letter(fk);
+                let vcl = col_letter(vk);
+                format!(
+                    "IFERROR(SUMIF('{sheet}'!{fcl}2:{fcl}100000,INDEX(base,i,{bk}),'{sheet}'!{vcl}2:{vcl}100000),0)"
+                )
+            }
+        } else {
+            let col = inside;
+            let idx = base_headers
+                .iter()
+                .position(|h| h == col)
+                .ok_or_else(|| format!("基准表缺少列「{col}」"))?
+                + 1;
+            format!("INDEX(base,i,{idx})")
+        };
+        out.push_str(&piece);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 fn write_new_premium_formulas(ws: &mut Worksheet, np: &NewPremiumTemplate) -> Result<(), String> {

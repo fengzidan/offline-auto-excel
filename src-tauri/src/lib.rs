@@ -7,9 +7,9 @@ mod schemes;
 mod writer;
 
 use commands::{
-    copy_scheme, delete_scheme, execute_pipeline, export_formula_template, list_schemes,
-    load_scheme, peek_raw_sheet, preview_source_table, preview_step, rename_scheme, save_scheme,
-    scan_source_dir,
+    copy_scheme, delete_scheme, execute_pipeline, export_formula_template, export_pipeline_file,
+    export_scheme, import_scheme, list_schemes, load_scheme, peek_raw_sheet, preview_source_table,
+    preview_step, rename_scheme, save_scheme, scan_source_dir,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -31,6 +31,9 @@ pub fn run() {
             delete_scheme,
             rename_scheme,
             copy_scheme,
+            export_scheme,
+            export_pipeline_file,
+            import_scheme,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

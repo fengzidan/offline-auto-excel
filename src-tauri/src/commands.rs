@@ -3,7 +3,8 @@ use crate::models::{
     ExecuteResult, Operation, Pipeline, PreviewData, RawSheetPreview, SchemeSummary, SourceTable,
 };
 use crate::writer::{
-    write_formula_template, write_results, FilterTemplate, NewPremiumTemplate, PivotTemplate,
+    sanitize_sheet_name, write_formula_template, write_results, CalcJoinTemplate, CalculateTemplate,
+    FilterTemplate, NewPremiumTemplate, PivotTemplate, SortTemplate,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -204,11 +205,39 @@ pub fn export_formula_template(pipeline: Pipeline, output_path: String) -> Resul
         })
         .collect();
 
+    // Map logical table id -> Excel sheet name + headers (for chaining filter/pivot/sort/…)
+    struct SheetRef {
+        name: String,
+        headers: Vec<String>,
+    }
+    let mut by_id: HashMap<String, SheetRef> = HashMap::new();
+    for m in &runtime.source_meta {
+        if let Some(t) = runtime.sources.get(&m.id) {
+            by_id.insert(
+                m.id.clone(),
+                SheetRef {
+                    name: sanitize_sheet_name(&format!("数据_{}", m.name)),
+                    headers: t.headers.clone(),
+                },
+            );
+        }
+    }
+
     let mut filter_tpl = None;
     let mut pivot_tpl = None;
+    let mut calculate_tpl = None;
+    let mut sort_tpls: Vec<SortTemplate> = Vec::new();
     let mut new_premium_tpl = None;
 
     for step in &pipeline.steps {
+        let sheet_name = step
+            .result
+            .as_ref()
+            .map(|r| r.sheet_name.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| step.name.clone());
+        let sheet_name = sanitize_sheet_name(&sheet_name);
+
         match &step.operation {
             Operation::Filter {
                 input_table_id,
@@ -221,14 +250,8 @@ pub fn export_formula_template(pipeline: Pipeline, output_path: String) -> Resul
                     .map(|s| s.name.clone())
                     .unwrap_or_else(|| input_table_id.clone());
                 let table = runtime.get_table(input_table_id)?;
-                let sheet_name = step
-                    .result
-                    .as_ref()
-                    .map(|r| r.sheet_name.clone())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| step.name.clone());
                 filter_tpl = Some(FilterTemplate {
-                    sheet_name,
+                    sheet_name: sheet_name.clone(),
                     data_sheet: src_name,
                     headers: table.headers.clone(),
                     conditions: conditions
@@ -237,96 +260,159 @@ pub fn export_formula_template(pipeline: Pipeline, output_path: String) -> Resul
                         .collect(),
                     data_rows: table.rows.len(),
                 });
+                by_id.insert(
+                    step.output_table_id.clone(),
+                    SheetRef {
+                        name: sheet_name,
+                        headers: table.headers.clone(),
+                    },
+                );
             }
             Operation::Pivot {
+                input_table_id,
                 row_fields,
                 value_fields,
                 value_field,
                 ..
             } => {
-                let filtered_sheet = filter_tpl
-                    .as_ref()
-                    .map(|f| f.sheet_name.clone())
+                let input_ref = by_id.get(input_table_id);
+                let filtered_sheet = input_ref
+                    .map(|r| r.name.clone())
+                    .or_else(|| filter_tpl.as_ref().map(|f| f.sheet_name.clone()))
                     .unwrap_or_else(|| "筛选结果".into());
-                let filtered_headers = filter_tpl
-                    .as_ref()
-                    .map(|f| f.headers.clone())
+                let filtered_headers = input_ref
+                    .map(|r| r.headers.clone())
+                    .or_else(|| filter_tpl.as_ref().map(|f| f.headers.clone()))
                     .unwrap_or_default();
-                let sheet_name = step
-                    .result
-                    .as_ref()
-                    .map(|r| r.sheet_name.clone())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| step.name.clone());
                 let first_value = value_fields
                     .first()
                     .map(|v| v.field.clone())
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| value_field.clone());
+                let mut headers = row_fields.clone();
+                let value_header = if let Some(v) = value_fields.first() {
+                    if !v.alias.trim().is_empty() {
+                        v.alias.clone()
+                    } else {
+                        let suffix = match v.aggregation.as_str() {
+                            "count" => "计数",
+                            "avg" => "平均",
+                            _ => "求和",
+                        };
+                        format!("{}_{suffix}", v.field)
+                    }
+                } else {
+                    format!("{first_value}_求和")
+                };
+                headers.push(value_header);
                 pivot_tpl = Some(PivotTemplate {
-                    sheet_name,
+                    sheet_name: sheet_name.clone(),
                     filtered_sheet,
                     row_fields: row_fields.clone(),
                     value_field: first_value,
                     filtered_headers,
                 });
+                by_id.insert(
+                    step.output_table_id.clone(),
+                    SheetRef {
+                        name: sheet_name,
+                        headers,
+                    },
+                );
+            }
+            Operation::Sort {
+                input_table_id,
+                keys,
+            } => {
+                let input = by_id.get(input_table_id).ok_or_else(|| {
+                    format!(
+                        "排序步骤「{}」的输入表未找到（公式模板需能追溯到筛选/透视等上游）",
+                        step.name
+                    )
+                })?;
+                let sort_keys: Vec<(String, bool)> = keys
+                    .iter()
+                    .filter(|k| !k.column.trim().is_empty())
+                    .map(|k| {
+                        (
+                            k.column.clone(),
+                            k.direction.eq_ignore_ascii_case("desc"),
+                        )
+                    })
+                    .collect();
+                if sort_keys.is_empty() {
+                    return Err(format!("排序步骤「{}」未配置排序字段", step.name));
+                }
+                let headers = input.headers.clone();
+                sort_tpls.push(SortTemplate {
+                    sheet_name: sheet_name.clone(),
+                    source_sheet: input.name.clone(),
+                    headers: headers.clone(),
+                    keys: sort_keys,
+                });
+                by_id.insert(
+                    step.output_table_id.clone(),
+                    SheetRef {
+                        name: sheet_name,
+                        headers,
+                    },
+                );
             }
             Operation::Calculate {
                 base_table_id,
                 output_field,
-                ..
+                formula,
+                joins,
             } => {
-                let right_name = runtime
-                    .source_meta
-                    .iter()
-                    .find(|s| s.id == *base_table_id)
-                    .map(|s| s.name.clone())
-                    .unwrap_or_else(|| base_table_id.clone());
-                let pivot_sheet = pivot_tpl
-                    .as_ref()
-                    .map(|p| p.sheet_name.clone())
-                    .unwrap_or_else(|| "透视".into());
-                let pivot_headers = pivot_tpl
-                    .as_ref()
-                    .map(|p| {
-                        let mut h = p.row_fields.clone();
-                        h.push(format!("{}_求和", p.value_field));
-                        h
-                    })
-                    .unwrap_or_default();
-                let sheet_name = step
-                    .result
-                    .as_ref()
-                    .map(|r| r.sheet_name.clone())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| step.name.clone());
-                // Best-effort export: treat as new-premium style sheet name
-                let _ = right_name;
-                new_premium_tpl = Some(NewPremiumTemplate {
-                    sheet_name,
-                    pivot_sheet,
-                    right_data_sheet: runtime
-                        .source_meta
-                        .first()
-                        .map(|s| s.name.clone())
-                        .unwrap_or_default(),
-                    left_key: String::new(),
-                    right_key: String::new(),
-                    left_value_field: String::new(),
-                    right_value_field: String::new(),
+                let base = by_id.get(base_table_id).ok_or_else(|| {
+                    format!(
+                        "计算步骤「{}」的基准表未找到（公式模板需能追溯到筛选/透视等上游）",
+                        step.name
+                    )
+                })?;
+                let mut join_tpls = Vec::new();
+                for j in joins {
+                    let right = by_id.get(&j.table_id).ok_or_else(|| {
+                        format!(
+                            "计算步骤「{}」的关联表「{}」未找到",
+                            step.name, j.table_id
+                        )
+                    })?;
+                    join_tpls.push(CalcJoinTemplate {
+                        table_id: j.table_id.clone(),
+                        sheet_name: right.name.clone(),
+                        base_key: j.base_key.clone(),
+                        foreign_key: j.foreign_key.clone(),
+                        headers: right.headers.clone(),
+                    });
+                }
+                let mut headers = base.headers.clone();
+                headers.push(output_field.clone());
+                calculate_tpl = Some(CalculateTemplate {
+                    sheet_name: sheet_name.clone(),
+                    base_sheet: base.name.clone(),
+                    base_table_id: base_table_id.clone(),
+                    base_headers: base.headers.clone(),
                     output_field: output_field.clone(),
-                    pivot_headers,
-                    right_headers: vec![],
+                    formula: formula.clone(),
+                    joins: join_tpls,
                 });
+                by_id.insert(
+                    step.output_table_id.clone(),
+                    SheetRef {
+                        name: sheet_name,
+                        headers,
+                    },
+                );
             }
             Operation::LookupSubtract {
+                left_table_id,
                 right_table_id,
                 left_key,
                 right_key,
                 left_value_field,
                 right_value_field,
                 output_field,
-                ..
             } => {
                 let right_name = runtime
                     .source_meta
@@ -335,26 +421,23 @@ pub fn export_formula_template(pipeline: Pipeline, output_path: String) -> Resul
                     .map(|s| s.name.clone())
                     .unwrap_or_else(|| right_table_id.clone());
                 let right = runtime.get_table(right_table_id)?;
-                let pivot_sheet = pivot_tpl
-                    .as_ref()
-                    .map(|p| p.sheet_name.clone())
+                let left = by_id.get(left_table_id);
+                let pivot_sheet = left
+                    .map(|r| r.name.clone())
+                    .or_else(|| pivot_tpl.as_ref().map(|p| p.sheet_name.clone()))
                     .unwrap_or_else(|| "透视".into());
-                let pivot_headers = pivot_tpl
-                    .as_ref()
-                    .map(|p| {
-                        let mut h = p.row_fields.clone();
-                        h.push(format!("{}_求和", p.value_field));
-                        h
+                let pivot_headers = left
+                    .map(|r| r.headers.clone())
+                    .or_else(|| {
+                        pivot_tpl.as_ref().map(|p| {
+                            let mut h = p.row_fields.clone();
+                            h.push(format!("{}_求和", p.value_field));
+                            h
+                        })
                     })
                     .unwrap_or_default();
-                let sheet_name = step
-                    .result
-                    .as_ref()
-                    .map(|r| r.sheet_name.clone())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| step.name.clone());
                 new_premium_tpl = Some(NewPremiumTemplate {
-                    sheet_name,
+                    sheet_name: sheet_name.clone(),
                     pivot_sheet,
                     right_data_sheet: right_name,
                     left_key: left_key.clone(),
@@ -362,11 +445,19 @@ pub fn export_formula_template(pipeline: Pipeline, output_path: String) -> Resul
                     left_value_field: left_value_field.clone(),
                     right_value_field: right_value_field.clone(),
                     output_field: output_field.clone(),
-                    pivot_headers,
+                    pivot_headers: pivot_headers.clone(),
                     right_headers: right.headers.clone(),
                 });
+                let mut headers = pivot_headers;
+                headers.push(output_field.clone());
+                by_id.insert(
+                    step.output_table_id.clone(),
+                    SheetRef {
+                        name: sheet_name,
+                        headers,
+                    },
+                );
             }
-            Operation::Sort { .. } => {}
             Operation::Dedupe { .. } => {}
             Operation::SideBySide { .. } => {}
             Operation::Vlookup { .. } => {}
@@ -378,6 +469,8 @@ pub fn export_formula_template(pipeline: Pipeline, output_path: String) -> Resul
         &source_refs,
         filter_tpl,
         pivot_tpl,
+        calculate_tpl,
+        &sort_tpls,
         new_premium_tpl,
     )?;
 
@@ -412,4 +505,19 @@ pub fn rename_scheme(app: AppHandle, id: String, name: String) -> Result<Pipelin
 #[tauri::command]
 pub fn copy_scheme(app: AppHandle, id: String) -> Result<Pipeline, String> {
     crate::schemes::copy_scheme(&app, &id)
+}
+
+#[tauri::command]
+pub fn export_scheme(app: AppHandle, id: String, output_path: String) -> Result<String, String> {
+    crate::schemes::export_scheme(&app, &id, &output_path)
+}
+
+#[tauri::command]
+pub fn export_pipeline_file(pipeline: Pipeline, output_path: String) -> Result<String, String> {
+    crate::schemes::export_pipeline(&pipeline, &output_path)
+}
+
+#[tauri::command]
+pub fn import_scheme(app: AppHandle, input_path: String) -> Result<Pipeline, String> {
+    crate::schemes::import_scheme(&app, &input_path)
 }

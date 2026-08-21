@@ -66,3 +66,15 @@ export function renameScheme(id: string, name: string) {
 export function copyScheme(id: string) {
   return invoke<Pipeline>("copy_scheme", { id });
 }
+
+export function exportScheme(id: string, outputPath: string) {
+  return invoke<string>("export_scheme", { id, outputPath });
+}
+
+export function exportPipelineFile(pipeline: Pipeline, outputPath: string) {
+  return invoke<string>("export_pipeline_file", { pipeline, outputPath });
+}
+
+export function importScheme(inputPath: string) {
+  return invoke<Pipeline>("import_scheme", { inputPath });
+}

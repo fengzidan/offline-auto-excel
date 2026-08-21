@@ -21,6 +21,9 @@ import {
   deleteScheme,
   executePipeline,
   exportFormulaTemplate,
+  exportPipelineFile,
+  exportScheme,
+  importScheme,
   listSchemes,
   loadScheme,
   peekRawSheet,
@@ -417,6 +420,65 @@ export default function App() {
     }
   }
 
+  function safeFileName(name: string) {
+    return name.replace(/[\\/:*?"<>|]/g, "_").trim() || "方案";
+  }
+
+  async function handleExportScheme(id: string) {
+    setCtxMenu(null);
+    const summary = schemes.find((s) => s.id === id);
+    const name =
+      pipeline?.id === id ? pipeline.name : summary?.name ?? "方案";
+    const path = await save({
+      filters: [{ name: "方案", extensions: ["json"] }],
+      defaultPath: `${safeFileName(name)}.json`,
+    });
+    if (!path) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const out =
+        pipeline?.id === id
+          ? await exportPipelineFile(pipeline, path)
+          : await exportScheme(id, path);
+      setStatus(`方案已导出：${out}`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleExportCurrentScheme() {
+    if (!pipeline) return;
+    await handleExportScheme(pipeline.id);
+  }
+
+  async function handleImportScheme() {
+    setCtxMenu(null);
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: "方案", extensions: ["json"] }],
+    });
+    if (!selected || Array.isArray(selected)) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const imported = await importScheme(selected);
+      await refreshSchemeList();
+      setPipeline(imported);
+      setDirty(false);
+      setSourcePreview(null);
+      setStepPreview(null);
+      setActiveStepId(imported.steps[0]?.id ?? null);
+      setStatus(`已导入方案「${imported.name}」`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function askDelete(id: string) {
     const current = schemes.find((s) => s.id === id);
     setDialog({ type: "delete", id, name: current?.name ?? "" });
@@ -747,8 +809,18 @@ export default function App() {
           <button type="button" className="primary" onClick={() => void handleNewScheme()}>
             新建方案
           </button>
+          <button type="button" disabled={busy} onClick={() => void handleImportScheme()}>
+            导入方案
+          </button>
           <button type="button" disabled={!pipeline || busy} onClick={() => void handleSave()}>
             保存{dirty ? " *" : ""}
+          </button>
+          <button
+            type="button"
+            disabled={!pipeline || busy}
+            onClick={() => void handleExportCurrentScheme()}
+          >
+            导出方案
           </button>
           <button type="button" disabled={!pipeline || busy} onClick={() => void runExecute()}>
             执行生成
@@ -1006,7 +1078,7 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="steps-body">
+                <div className={`steps-body ${stepPreview ? "with-preview" : ""}`}>
                   <div className="steps-list">
                     <DndContext
                       sensors={sensors}
@@ -1028,6 +1100,9 @@ export default function App() {
                             step={step}
                             active={step.id === activeStepId}
                             onSelect={() => {
+                              if (step.id !== activeStepId) {
+                                setStepPreview(null);
+                              }
                               setActiveStepId(step.id);
                             }}
                           />
@@ -1067,10 +1142,12 @@ export default function App() {
                     )}
                   </div>
 
-                  <div className="step-preview">
-                    <div className="mini-head">预览</div>
-                    <PreviewTable data={stepPreview} />
-                  </div>
+                  {stepPreview && (
+                    <div className="step-preview">
+                      <div className="mini-head">预览</div>
+                      <PreviewTable data={stepPreview} />
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -1205,6 +1282,9 @@ export default function App() {
         >
           <button type="button" onClick={() => void handleCopyScheme(ctxMenu.id)}>
             复制
+          </button>
+          <button type="button" onClick={() => void handleExportScheme(ctxMenu.id)}>
+            导出
           </button>
           <button
             type="button"
@@ -1972,21 +2052,16 @@ function StepEditor({
           </label>
           {op.conditions.map((c, i) => (
             <div className="cond-row" key={i}>
-              <input
-                list={`fc-${step.id}-${i}`}
+              <SearchableSelect
                 value={c.column}
-                placeholder="列名"
-                onChange={(e) => {
+                options={headersFor(op.inputTableId)}
+                placeholder="搜索列名"
+                onChange={(column) => {
                   const conditions = [...op.conditions];
-                  conditions[i] = { ...c, column: e.target.value };
+                  conditions[i] = { ...c, column };
                   onChange({ ...step, operation: { ...op, conditions } });
                 }}
               />
-              <datalist id={`fc-${step.id}-${i}`}>
-                {headersFor(op.inputTableId).map((h) => (
-                  <option key={h} value={h} />
-                ))}
-              </datalist>
               <select
                 value={c.op}
                 onChange={(e) => {
@@ -2002,17 +2077,22 @@ function StepEditor({
                 <option value="empty">为空</option>
                 <option value="not_empty">非空</option>
               </select>
-              <input
-                value={c.value}
-                placeholder="值"
-                onChange={(e) => {
-                  const conditions = [...op.conditions];
-                  conditions[i] = { ...c, value: e.target.value };
-                  onChange({ ...step, operation: { ...op, conditions } });
-                }}
-              />
+              {c.op !== "empty" && c.op !== "not_empty" ? (
+                <input
+                  value={c.value}
+                  placeholder="值"
+                  onChange={(e) => {
+                    const conditions = [...op.conditions];
+                    conditions[i] = { ...c, value: e.target.value };
+                    onChange({ ...step, operation: { ...op, conditions } });
+                  }}
+                />
+              ) : (
+                <span className="cond-spacer" />
+              )}
               <button
                 type="button"
+                className="cond-remove"
                 onClick={() =>
                   onChange({
                     ...step,

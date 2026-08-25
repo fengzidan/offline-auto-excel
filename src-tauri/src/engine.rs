@@ -31,7 +31,7 @@ fn load_source_table(
     }
 }
 
-fn op_table_ids(op: &Operation) -> Vec<String> {
+pub fn op_table_ids(op: &Operation) -> Vec<String> {
     match op {
         Operation::Filter { input_table_id, .. }
         | Operation::Pivot { input_table_id, .. }
@@ -134,6 +134,19 @@ impl Runtime {
         let table = load_source_table(&meta, &self.header_rows, &self.folder_merges)?;
         self.sources.insert(id.to_string(), table);
         Ok(())
+    }
+
+    /// Source table ids directly referenced by steps (not intermediate tmp: outputs).
+    pub fn used_source_ids(&self, pipeline: &Pipeline) -> HashSet<String> {
+        let mut needed = HashSet::new();
+        for step in &pipeline.steps {
+            for id in op_table_ids(&step.operation) {
+                if self.is_source_id(&id) {
+                    needed.insert(id);
+                }
+            }
+        }
+        needed
     }
 
     fn ensure_sources_for_pipeline(

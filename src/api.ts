@@ -78,3 +78,34 @@ export function exportPipelineFile(pipeline: Pipeline, outputPath: string) {
 export function importScheme(inputPath: string) {
   return invoke<Pipeline>("import_scheme", { inputPath });
 }
+
+export interface FolderRunPrep {
+  pipeline: Pipeline;
+  missingTables: string[];
+  headerUnready: string[];
+}
+
+export function prepareFolderRun(schemeId: string, folder: string) {
+  return invoke<FolderRunPrep>("prepare_folder_run", { schemeId, folder });
+}
+
+export function executeSchemeInFolder(schemeId: string, folder: string) {
+  return invoke<ExecuteResult>("execute_scheme_in_folder", { schemeId, folder });
+}
+
+export function syncFolderContextMenu() {
+  return invoke<void>("sync_folder_context_menu");
+}
+
+export function unregisterFolderContextMenu() {
+  return invoke<string>("unregister_folder_context_menu");
+}
+
+export interface FolderRunRequest {
+  folder: string;
+  schemeId?: string | null;
+}
+
+export function takePendingFolderRun() {
+  return invoke<FolderRunRequest | null>("take_pending_folder_run");
+}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   DndContext,
   closestCenter,
@@ -14,12 +14,14 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { open, save } from "@tauri-apps/plugin-dialog";
-import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { message, open, save } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   copyScheme,
   deleteScheme,
   executePipeline,
+  executeSchemeInFolder,
   exportFormulaTemplate,
   exportPipelineFile,
   exportScheme,
@@ -31,6 +33,8 @@ import {
   previewStep,
   saveScheme,
   scanSourceDir,
+  syncFolderContextMenu,
+  takePendingFolderRun,
 } from "./api";
 import {
   createEmptyPipeline,
@@ -209,6 +213,7 @@ export default function App() {
     | { type: "new" }
     | { type: "delete"; id: string; name: string }
     | { type: "unsaved"; nextId: string }
+    | { type: "folder-run"; folder: string }
     | null
   >(null);
   const [dialogInput, setDialogInput] = useState("未命名方案");
@@ -219,6 +224,8 @@ export default function App() {
   const [dirty, setDirty] = useState(false);
   const [headerCache, setHeaderCache] = useState<Record<string, string[]>>({});
   const [lastExport, setLastExport] = useState<ExecuteResult | null>(null);
+  const statusClearTimer = useRef<number | null>(null);
+  const exportClearTimer = useRef<number | null>(null);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -252,6 +259,11 @@ export default function App() {
   const refreshSchemeList = useCallback(async () => {
     try {
       setSchemes(await listSchemes());
+      try {
+        await syncFolderContextMenu();
+      } catch {
+        /* shell menu sync is best-effort */
+      }
     } catch (e) {
       setError(String(e));
     }
@@ -266,6 +278,141 @@ export default function App() {
     window.addEventListener("click", close);
     return () => window.removeEventListener("click", close);
   }, []);
+
+  async function alertError(title: string, body: string) {
+    try {
+      await message(body, { title, kind: "error" });
+    } catch {
+      window.alert(`${title}\n${body}`);
+    }
+  }
+
+  function playSuccessDing() {
+    try {
+      const Ctx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext })
+          .webkitAudioContext;
+      if (!Ctx) return;
+      const ctx = new Ctx();
+      const now = ctx.currentTime;
+      const beep = (freq: number, start: number, dur: number, gain = 0.08) => {
+        const osc = ctx.createOscillator();
+        const g = ctx.createGain();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        g.gain.setValueAtTime(0.0001, now + start);
+        g.gain.exponentialRampToValueAtTime(gain, now + start + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + start + dur);
+        osc.connect(g);
+        g.connect(ctx.destination);
+        osc.start(now + start);
+        osc.stop(now + start + dur + 0.02);
+      };
+      beep(880, 0, 0.12);
+      beep(1320, 0.12, 0.16);
+      window.setTimeout(() => void ctx.close(), 500);
+    } catch {
+      /* ignore audio failures */
+    }
+  }
+
+  function clearSuccessTimers() {
+    if (statusClearTimer.current != null) {
+      window.clearTimeout(statusClearTimer.current);
+      statusClearTimer.current = null;
+    }
+    if (exportClearTimer.current != null) {
+      window.clearTimeout(exportClearTimer.current);
+      exportClearTimer.current = null;
+    }
+  }
+
+  function showExportSuccess(result: ExecuteResult, statusText?: string) {
+    clearSuccessTimers();
+    setLastExport(result);
+    setStatus(statusText || result.message || "执行完成");
+    playSuccessDing();
+    exportClearTimer.current = window.setTimeout(() => {
+      setLastExport(null);
+      exportClearTimer.current = null;
+    }, 5000);
+    statusClearTimer.current = window.setTimeout(() => {
+      setStatus((prev) =>
+        prev === (statusText || result.message || "执行完成") ? "就绪" : prev,
+      );
+      statusClearTimer.current = null;
+    }, 5000);
+  }
+
+  useEffect(() => {
+    return () => clearSuccessTimers();
+  }, []);
+
+  function openFolderRunPicker(folder: string) {
+    setDialog({ type: "folder-run", folder });
+    setCtxMenu(null);
+  }
+
+  function handleFolderRunRequest(req: {
+    folder: string;
+    schemeId?: string | null;
+  }) {
+    if (req.schemeId) {
+      void runSchemeInFolder(req.schemeId, req.folder);
+      return;
+    }
+    openFolderRunPicker(req.folder);
+  }
+
+  async function runSchemeInFolder(schemeId: string, folder: string) {
+    setBusy(true);
+    setError(null);
+    setDialog(null);
+    try {
+      const result = await executeSchemeInFolder(schemeId, folder);
+      showExportSuccess(result, result.message || "文件夹执行完成");
+    } catch (e) {
+      const msg = String(e);
+      setError(msg);
+      await alertError("执行失败", msg);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      try {
+        const pending = await takePendingFolderRun();
+        if (pending?.folder) handleFolderRunRequest(pending);
+      } catch {
+        /* ignore */
+      }
+      unlisten = await listen<{ folder: string; schemeId?: string | null }>(
+        "folder-run",
+        (ev) => {
+          if (ev.payload?.folder) handleFolderRunRequest(ev.payload);
+        },
+      );
+    })();
+    return () => {
+      unlisten?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function handleRunSchemeOnFolder(schemeId: string) {
+    setCtxMenu(null);
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: "选择要执行方案的文件夹",
+    });
+    if (!selected || Array.isArray(selected)) return;
+    await runSchemeInFolder(schemeId, selected);
+  }
 
   async function refreshSources(p: Pipeline) {
     if (!p.sourceDir) {
@@ -740,21 +887,14 @@ export default function App() {
       setPipeline(saved);
       setDirty(false);
       const result = await executePipeline(saved);
-      setLastExport(result);
-      setStatus(result.message);
+      showExportSuccess(result);
       await refreshSchemeList();
     } catch (e) {
-      setError(String(e));
+      const msg = String(e);
+      setError(msg);
+      await alertError("执行失败", msg);
     } finally {
       setBusy(false);
-    }
-  }
-
-  async function openResultFile(path: string) {
-    try {
-      await openPath(path);
-    } catch (e) {
-      setError(`无法打开文件：${e}`);
     }
   }
 
@@ -1233,27 +1373,15 @@ export default function App() {
           <div className="export-banner-main">
             <strong>生成成功</strong>
             <span className="export-sheets">
-              Sheet：{lastExport.sheetNames.join("、") || "—"}
+              Sheet：{lastExport.sheetNames.join("、") || "—"} · 5 秒后自动关闭
             </span>
             {lastExport.outputFiles.map((path) => (
               <div key={path} className="export-file-row">
-                <button
-                  type="button"
-                  className="linkish"
-                  title="打开文件"
-                  onClick={() => void openResultFile(path)}
-                >
+                <span className="export-path" title={path}>
                   {path}
-                </button>
-                <button
-                  type="button"
-                  className="primary"
-                  onClick={() => void openResultFile(path)}
-                >
-                  打开
-                </button>
+                </span>
                 <button type="button" onClick={() => void revealResultFile(path)}>
-                  在文件夹中显示
+                  查看文件夹
                 </button>
               </div>
             ))}
@@ -1285,6 +1413,12 @@ export default function App() {
           </button>
           <button type="button" onClick={() => void handleExportScheme(ctxMenu.id)}>
             导出
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleRunSchemeOnFolder(ctxMenu.id)}
+          >
+            对文件夹执行
           </button>
           <button
             type="button"
@@ -1374,6 +1508,40 @@ export default function App() {
                     onClick={() => void resolveUnsaved(true)}
                   >
                     保存并打开
+                  </button>
+                </div>
+              </>
+            )}
+            {dialog.type === "folder-run" && (
+              <>
+                <h3>选择要执行的方案</h3>
+                <p className="modal-text">
+                  将使用文件夹：
+                  <br />
+                  <code className="path-code">{dialog.folder}</code>
+                  <br />
+                  按方案内同名表复用表头与步骤，结果输出到该文件夹。
+                </p>
+                <div className="folder-run-list">
+                  {schemes.length === 0 && (
+                    <div className="muted">暂无方案，请先在应用内创建或导入</div>
+                  )}
+                  {schemes.map((s) => (
+                    <button
+                      key={s.id}
+                      type="button"
+                      className="folder-run-item"
+                      disabled={busy}
+                      onClick={() => void runSchemeInFolder(s.id, dialog.folder)}
+                    >
+                      <strong>{s.name}</strong>
+                      <span>{s.updatedAt || "—"}</span>
+                    </button>
+                  ))}
+                </div>
+                <div className="modal-actions">
+                  <button type="button" onClick={() => setDialog(null)}>
+                    取消
                   </button>
                 </div>
               </>

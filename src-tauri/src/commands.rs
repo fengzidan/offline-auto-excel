@@ -67,6 +67,11 @@ pub fn preview_step(pipeline: Pipeline, step_id: String, limit: usize) -> Result
 
 #[tauri::command]
 pub fn execute_pipeline(pipeline: Pipeline) -> Result<ExecuteResult, String> {
+    run_pipeline_inner(pipeline)
+}
+
+/// Shared execute path (GUI + folder context-menu run).
+pub fn run_pipeline_inner(pipeline: Pipeline) -> Result<ExecuteResult, String> {
     if pipeline.output_dir.trim().is_empty() {
         return Err("请先配置输出目录".into());
     }
@@ -75,15 +80,16 @@ pub fn execute_pipeline(pipeline: Pipeline) -> Result<ExecuteResult, String> {
     }
 
     let mut runtime = Runtime::from_pipeline(&pipeline)?;
+    let used = runtime.used_source_ids(&pipeline);
     let bad: Vec<_> = runtime
         .source_meta
         .iter()
-        .filter(|s| !s.header_ok)
+        .filter(|s| used.contains(&s.id) && !s.header_ok)
         .map(|s| s.name.clone())
         .collect();
     if !bad.is_empty() {
         return Err(format!(
-            "以下源表未识别表头，请先手动指定表头行：{}",
+            "以下步骤用到的源表未识别表头，请先手动指定表头行：{}",
             bad.join("、")
         ));
     }
@@ -184,6 +190,37 @@ pub fn execute_pipeline(pipeline: Pipeline) -> Result<ExecuteResult, String> {
         sheet_names,
         message: "执行完成".into(),
     })
+}
+
+#[tauri::command]
+pub fn prepare_folder_run(
+    app: AppHandle,
+    scheme_id: String,
+    folder: String,
+) -> Result<crate::folder_run::FolderRunPrep, String> {
+    let pipeline = crate::schemes::load_scheme(&app, &scheme_id)?;
+    let path = crate::folder_run::resolve_folder_arg(&folder)?;
+    crate::folder_run::prepare_scheme_for_folder(pipeline, &path)
+}
+
+#[tauri::command]
+pub fn execute_scheme_in_folder(
+    app: AppHandle,
+    scheme_id: String,
+    folder: String,
+) -> Result<ExecuteResult, String> {
+    let path = crate::folder_run::resolve_folder_arg(&folder)?;
+    crate::folder_run::execute_scheme_in_folder(&app, &scheme_id, &path)
+}
+
+#[tauri::command]
+pub fn sync_folder_context_menu(app: AppHandle) -> Result<(), String> {
+    crate::shell_menu::sync_from_app(&app)
+}
+
+#[tauri::command]
+pub fn unregister_folder_context_menu() -> Result<String, String> {
+    crate::shell_menu::unregister()
 }
 
 #[tauri::command]

@@ -122,7 +122,7 @@ pub fn prepare_scheme_for_folder(
     })
 }
 
-/// Load scheme, bind to folder, execute. Fails early if required tables are missing.
+/// Load scheme, bind to folder, **persist** source/output dirs, then execute.
 pub fn execute_scheme_in_folder(
     app: &tauri::AppHandle,
     scheme_id: &str,
@@ -142,7 +142,9 @@ pub fn execute_scheme_in_folder(
             prep.header_unready.join("、")
         ));
     }
-    crate::commands::run_pipeline_inner(prep.pipeline)
+    // Persist remapped source_dir / output_dir / header_rows into the scheme
+    let saved = crate::schemes::save_scheme(app, prep.pipeline)?;
+    crate::commands::run_pipeline_inner(saved)
 }
 
 /// Resolve a path that may be relative to cwd.

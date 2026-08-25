@@ -372,6 +372,17 @@ export default function App() {
     try {
       const result = await executeSchemeInFolder(schemeId, folder);
       showExportSuccess(result, result.message || "文件夹执行完成");
+      await refreshSchemeList();
+      // If this scheme is open in the UI, reload so source/output dirs match disk
+      if (pipeline?.id === schemeId) {
+        const loaded = await loadScheme(schemeId);
+        if (!loaded.headerRows) loaded.headerRows = {};
+        if (!loaded.outputSheets) loaded.outputSheets = [];
+        if (!loaded.folderMerges) loaded.folderMerges = {};
+        loaded.outputSheets = syncOutputSheets(loaded);
+        setPipeline(loaded);
+        setDirty(false);
+      }
     } catch (e) {
       const msg = String(e);
       setError(msg);

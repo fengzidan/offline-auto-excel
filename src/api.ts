@@ -109,6 +109,7 @@ export interface FolderRunPrep {
   pipeline: Pipeline;
   missingTables: string[];
   headerUnready: string[];
+  dirsChanged: boolean;
 }
 
 export function prepareFolderRun(schemeId: string, folder: string) {

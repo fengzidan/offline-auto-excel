@@ -185,10 +185,30 @@ fn header_override_for(
     file_path: &str,
     folder_path: Option<&str>,
 ) -> Option<usize> {
-    header_overrides
-        .get(file_path)
-        .copied()
-        .or_else(|| folder_path.and_then(|fp| header_overrides.get(fp).copied()))
+    if let Some(row) = header_overrides.get(file_path).copied() {
+        return Some(row);
+    }
+    if let Some(fp) = folder_path {
+        if let Some(row) = header_overrides.get(fp).copied() {
+            return Some(row);
+        }
+    }
+    let path = Path::new(file_path);
+    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+        if let Some(row) = header_overrides.get(name).copied() {
+            return Some(row);
+        }
+    }
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+        if let Some(row) = header_overrides.get(stem).copied() {
+            return Some(row);
+        }
+        let src_id = format!("src:{stem}");
+        if let Some(row) = header_overrides.get(&src_id).copied() {
+            return Some(row);
+        }
+    }
+    None
 }
 
 fn canonical_merge_key(s: &str) -> String {
@@ -790,7 +810,7 @@ fn scan_file_table(
         .to_string();
     let path_str = path.display().to_string();
     let id = format!("src:{name}");
-    let override_row = header_overrides.get(&path_str).copied();
+    let override_row = header_override_for(header_overrides, &path_str, None);
 
     match scan_sheet_meta(path, override_row) {
         Ok((headers, header_row, row_count)) => Ok(crate::models::SourceTable {

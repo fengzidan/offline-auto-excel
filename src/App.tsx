@@ -144,6 +144,57 @@ function clonePipeline(p: Pipeline): Pipeline {
   return structuredClone(p);
 }
 
+/** Persist header-row picks under path / matcher id / filename for export & reuse. */
+function mergeHeaderRowsFromSources(
+  headerRows: Record<string, number> | undefined,
+  sources: SourceTable[],
+): Record<string, number> {
+  const next: Record<string, number> = { ...(headerRows ?? {}) };
+  for (const t of sources) {
+    if (!t.headerOk || !(t.headerRow > 0)) continue;
+    const row = t.headerRow;
+    if (t.path?.trim()) next[t.path] = row;
+    if (t.id?.trim()) next[t.id] = row;
+    const base = (t.path || t.matchedName || t.name || "")
+      .replace(/\\/g, "/")
+      .split("/")
+      .filter(Boolean)
+      .pop();
+    if (base) {
+      next[base] = row;
+      const stem = base.replace(/\.[^.]+$/, "");
+      if (stem) {
+        next[stem] = row;
+        if (!stem.startsWith("src:")) next[`src:${stem}`] = row;
+      }
+    }
+  }
+  return next;
+}
+
+function headerRowEntriesForTable(
+  table: SourceTable,
+  row: number,
+): Record<string, number> {
+  const entries: Record<string, number> = {};
+  if (table.path?.trim()) entries[table.path] = row;
+  if (table.id?.trim()) entries[table.id] = row;
+  const base = (table.path || table.matchedName || table.name || "")
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter(Boolean)
+    .pop();
+  if (base) {
+    entries[base] = row;
+    const stem = base.replace(/\.[^.]+$/, "");
+    if (stem) {
+      entries[stem] = row;
+      if (!stem.startsWith("src:")) entries[`src:${stem}`] = row;
+    }
+  }
+  return entries;
+}
+
 /** Whether another step already consumes this step's output / has an outgoing edge. */
 function stepHasDownstream(
   step: Step,
@@ -1662,10 +1713,18 @@ export default function App() {
     autosaveInflightRef.current = true;
     if (!opts?.quiet) setBusy(true);
     try {
-      const saved = await saveScheme(current);
-      const latest = pipelineRef.current ?? current;
+      const withHeaders: Pipeline = {
+        ...current,
+        headerRows: mergeHeaderRowsFromSources(
+          current.headerRows,
+          sourcesRef.current,
+        ),
+      };
+      const saved = await saveScheme(withHeaders);
+      const latest = pipelineRef.current ?? withHeaders;
       const merged: Pipeline = {
         ...saved,
+        headerRows: withHeaders.headerRows,
         flowPositions: latest.flowPositions ?? saved.flowPositions,
         flowEdges: latest.flowEdges ?? saved.flowEdges,
       };
@@ -1729,7 +1788,16 @@ export default function App() {
     try {
       const out =
         pipeline?.id === id
-          ? await exportPipelineFile(pipeline, path)
+          ? await exportPipelineFile(
+              {
+                ...pipeline,
+                headerRows: mergeHeaderRowsFromSources(
+                  pipeline.headerRows,
+                  sourcesRef.current,
+                ),
+              },
+              path,
+            )
           : await exportScheme(id, path);
       setStatus(`方案已导出：${out}`);
     } catch (e) {
@@ -2031,13 +2099,14 @@ export default function App() {
     const table = sources.find((s) => s.id === mappingTableId);
     if (!table) return;
     const targetId = mappingTableId;
+    const rowEntries = headerRowEntriesForTable(table, pickedHeaderRow);
     const nextRows = {
       ...pipeline.headerRows,
-      [table.path]: pickedHeaderRow,
+      ...rowEntries,
     };
     updatePipeline((p) => ({
       ...p,
-      headerRows: { ...p.headerRows, [table.path]: pickedHeaderRow },
+      headerRows: { ...p.headerRows, ...rowEntries },
     }));
     setBusy(true);
     try {

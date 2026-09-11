@@ -159,7 +159,15 @@ pub fn copy_scheme(app: &AppHandle, id: &str) -> Result<Pipeline, String> {
 
 /// Write a scheme JSON to an arbitrary path (for backup / sharing).
 pub fn export_scheme(app: &AppHandle, id: &str, output_path: &str) -> Result<String, String> {
-    let pipeline = load_scheme(app, id)?;
+    let mut pipeline = load_scheme(app, id)?;
+    pipeline.header_rows = crate::folder_run::enrich_header_rows(&pipeline.header_rows);
+    export_pipeline(&pipeline, output_path)
+}
+
+/// Export an in-memory pipeline (e.g. current unsaved edits) to a path.
+pub fn export_pipeline(pipeline: &Pipeline, output_path: &str) -> Result<String, String> {
+    let mut pipeline = pipeline.clone();
+    pipeline.header_rows = crate::folder_run::enrich_header_rows(&pipeline.header_rows);
     let path = PathBuf::from(output_path);
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -167,19 +175,6 @@ pub fn export_scheme(app: &AppHandle, id: &str, output_path: &str) -> Result<Str
         }
     }
     let json = serde_json::to_string_pretty(&pipeline).map_err(|e| e.to_string())?;
-    fs::write(&path, json).map_err(|e| e.to_string())?;
-    Ok(path.display().to_string())
-}
-
-/// Export an in-memory pipeline (e.g. current unsaved edits) to a path.
-pub fn export_pipeline(pipeline: &Pipeline, output_path: &str) -> Result<String, String> {
-    let path = PathBuf::from(output_path);
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-    }
-    let json = serde_json::to_string_pretty(pipeline).map_err(|e| e.to_string())?;
     fs::write(&path, json).map_err(|e| e.to_string())?;
     Ok(path.display().to_string())
 }
@@ -197,6 +192,8 @@ pub fn import_scheme(app: &AppHandle, input_path: &str) -> Result<Pipeline, Stri
     if existing.iter().any(|n| n == &pipeline.name) {
         pipeline.name = unique_import_name(&pipeline.name, &existing);
     }
+    // Make header-row overrides portable (basename / src:id) for new machines/folders.
+    pipeline.header_rows = crate::folder_run::enrich_header_rows(&pipeline.header_rows);
     save_scheme(app, pipeline)
 }
 

@@ -3,12 +3,14 @@ use crate::models::{
     ExecuteResult, Operation, Pipeline, PreviewData, RawSheetPreview, SchemeSummary, SourceTable,
 };
 use crate::writer::{
-    sanitize_sheet_name, write_formula_template, write_results, CalcJoinTemplate, CalculateTemplate,
-    FilterTemplate, NewPremiumTemplate, PivotTemplate, SortTemplate,
+    sanitize_sheet_name, write_formula_template, write_results, CalcColumnTemplate, CalcJoinTemplate,
+    CalculateTemplate, FilterTemplate, NewPremiumTemplate, PivotTemplate, SortTemplate,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use tauri::AppHandle;
+use std::thread;
+use std::time::Duration;
+use tauri::{AppHandle, Emitter};
 
 #[tauri::command]
 pub fn scan_source_dir(
@@ -17,6 +19,15 @@ pub fn scan_source_dir(
 ) -> Result<Vec<SourceTable>, String> {
     let runtime = Runtime::from_scan(PathBuf::from(&path).as_path(), &header_rows)?;
     Ok(runtime.source_meta)
+}
+
+#[tauri::command]
+pub fn dir_exists(path: String) -> bool {
+    let t = path.trim();
+    if t.is_empty() {
+        return false;
+    }
+    PathBuf::from(t).is_dir()
 }
 
 #[tauri::command]
@@ -37,6 +48,7 @@ pub fn preview_source_table(
             rows: preview.rows,
             total_rows: preview.total_rows,
             header_groups: vec![],
+            header_bands: vec![],
         });
     }
     let (table, _, total) =
@@ -46,6 +58,7 @@ pub fn preview_source_table(
         rows: table.rows,
         total_rows: total,
         header_groups: table.header_groups,
+        header_bands: table.header_bands,
     })
 }
 
@@ -66,14 +79,81 @@ pub fn preview_step(pipeline: Pipeline, step_id: String, limit: usize) -> Result
 }
 
 #[tauri::command]
-pub fn execute_pipeline(pipeline: Pipeline) -> Result<ExecuteResult, String> {
-    run_pipeline_inner(pipeline)
+pub async fn execute_pipeline(
+    app: AppHandle,
+    mut pipeline: Pipeline,
+    runtime_params: Option<HashMap<String, String>>,
+) -> Result<ExecuteResult, String> {
+    let values = runtime_params.unwrap_or_default();
+    let fields = crate::runtime_params::collect_prompt_fields(&pipeline);
+    crate::runtime_params::validate_runtime_params(&fields, &values)?;
+    pipeline = crate::runtime_params::apply_runtime_params(pipeline, &values);
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || run_pipeline_inner(Some(&app2), pipeline))
+        .await
+        .map_err(|e| format!("执行任务失败: {e}"))?
 }
 
 /// Shared execute path (GUI + folder context-menu run).
-pub fn run_pipeline_inner(pipeline: Pipeline) -> Result<ExecuteResult, String> {
+pub fn run_pipeline_inner(
+    app: Option<&AppHandle>,
+    mut pipeline: Pipeline,
+) -> Result<ExecuteResult, String> {
+    // Prefer start-node / output-node directories when present
+    if let Some(start) = pipeline
+        .steps
+        .iter()
+        .find(|s| matches!(s.operation, Operation::Start { .. }))
+    {
+        if let Operation::Start { source_dir } = &start.operation {
+            if !source_dir.trim().is_empty() {
+                pipeline.source_dir = source_dir.clone();
+            }
+        }
+    }
+    if let Some(out) = pipeline.steps.iter().find(|s| matches!(s.operation, Operation::Output { .. }))
+    {
+        if let Operation::Output {
+            output_dir,
+            sheets,
+        } = &out.operation
+        {
+            if !output_dir.trim().is_empty() {
+                pipeline.output_dir = output_dir.clone();
+            }
+            if !sheets.is_empty() {
+                let mut resolved = Vec::new();
+                for sh in sheets {
+                    let tid = sh.table_id.trim();
+                    if tid.is_empty() {
+                        continue;
+                    }
+                    let Some(producer) = pipeline
+                        .steps
+                        .iter()
+                        .find(|s| s.output_table_id == tid && !matches!(s.operation, Operation::Output { .. }))
+                    else {
+                        continue;
+                    };
+                    let name = if sh.sheet_name.trim().is_empty() {
+                        producer.name.clone()
+                    } else {
+                        sh.sheet_name.clone()
+                    };
+                    resolved.push(crate::models::OutputSheet {
+                        step_id: producer.id.clone(),
+                        sheet_name: name,
+                    });
+                }
+                if !resolved.is_empty() {
+                    pipeline.output_sheets = resolved;
+                }
+            }
+        }
+    }
+
     if pipeline.output_dir.trim().is_empty() {
-        return Err("请先配置输出目录".into());
+        return Err("请先在「输出」节点配置输出目录".into());
     }
     if pipeline.source_dir.trim().is_empty() {
         return Err("请先配置源数据目录".into());
@@ -94,7 +174,15 @@ pub fn run_pipeline_inner(pipeline: Pipeline) -> Result<ExecuteResult, String> {
         ));
     }
 
-    runtime.run_until(&pipeline, None)?;
+    runtime.run_until_with_progress(&pipeline, None, |progress| {
+        if let Some(handle) = app {
+            let _ = handle.emit("execute-progress", &progress);
+            // 给前端一点时间刷新节点高亮
+            if progress.phase == "start" {
+                thread::sleep(Duration::from_millis(90));
+            }
+        }
+    })?;
 
     // Resolve final sheet list: prefer pipeline.output_sheets order
     let mut resolved_sheets: Vec<(String, String, crate::models::DataTable)> = Vec::new();
@@ -161,7 +249,7 @@ pub fn run_pipeline_inner(pipeline: Pipeline) -> Result<ExecuteResult, String> {
     }
 
     if resolved_sheets.is_empty() {
-        return Err("没有标记为结果的步骤，请至少勾选一个步骤的「作为结果」".into());
+        return Err("「输出」节点尚未接入任何结果表，请将步骤连到输出节点".into());
     }
 
     let sheet_names: Vec<String> = resolved_sheets.iter().map(|(n, _, _)| n.clone()).collect();
@@ -204,13 +292,24 @@ pub fn prepare_folder_run(
 }
 
 #[tauri::command]
-pub fn execute_scheme_in_folder(
+pub async fn execute_scheme_in_folder(
     app: AppHandle,
     scheme_id: String,
     folder: String,
+    runtime_params: Option<HashMap<String, String>>,
 ) -> Result<ExecuteResult, String> {
     let path = crate::folder_run::resolve_folder_arg(&folder)?;
-    crate::folder_run::execute_scheme_in_folder(&app, &scheme_id, &path)
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::folder_run::execute_scheme_in_folder(
+            &app2,
+            &scheme_id,
+            &path,
+            runtime_params.as_ref(),
+        )
+    })
+    .await
+    .map_err(|e| format!("执行任务失败: {e}"))?
 }
 
 #[tauri::command]
@@ -279,6 +378,7 @@ pub fn export_formula_template(pipeline: Pipeline, output_path: String) -> Resul
             Operation::Filter {
                 input_table_id,
                 conditions,
+                match_mode,
             } => {
                 let src_name = runtime
                     .source_meta
@@ -293,9 +393,17 @@ pub fn export_formula_template(pipeline: Pipeline, output_path: String) -> Resul
                     headers: table.headers.clone(),
                     conditions: conditions
                         .iter()
-                        .map(|c| (c.column.clone(), c.op.clone(), c.value.clone()))
+                        .map(|c| {
+                            (
+                                c.column.clone(),
+                                c.op.clone(),
+                                c.value.clone(),
+                                c.join.clone(),
+                            )
+                        })
                         .collect(),
                     data_rows: table.rows.len(),
+                    match_mode: match_mode.clone(),
                 });
                 by_id.insert(
                     step.output_table_id.clone(),
@@ -399,8 +507,14 @@ pub fn export_formula_template(pipeline: Pipeline, output_path: String) -> Resul
                 base_table_id,
                 output_field,
                 formula,
+                columns,
                 joins,
             } => {
+                let calc_cols =
+                    crate::ops::resolve_calc_columns(output_field, formula, columns);
+                if calc_cols.is_empty() {
+                    return Err(format!("计算步骤「{}」请至少添加一列计算", step.name));
+                }
                 let base = by_id.get(base_table_id).ok_or_else(|| {
                     format!(
                         "计算步骤「{}」的基准表未找到（公式模板需能追溯到筛选/透视等上游）",
@@ -409,30 +523,100 @@ pub fn export_formula_template(pipeline: Pipeline, output_path: String) -> Resul
                 })?;
                 let mut join_tpls = Vec::new();
                 for j in joins {
+                    if j.table_id.trim().is_empty() {
+                        continue;
+                    }
                     let right = by_id.get(&j.table_id).ok_or_else(|| {
                         format!(
                             "计算步骤「{}」的关联表「{}」未找到",
                             step.name, j.table_id
                         )
                     })?;
+                    let mut base_key = j.base_key.clone();
+                    let mut foreign_key = j.foreign_key.clone();
+                    if base_key.trim().is_empty() || foreign_key.trim().is_empty() {
+                        if let Some((bk, fk)) =
+                            crate::ops::guess_join_keys(&base.headers, &right.headers)
+                        {
+                            if base_key.trim().is_empty() {
+                                base_key = bk;
+                            }
+                            if foreign_key.trim().is_empty() {
+                                foreign_key = fk;
+                            }
+                        }
+                    }
+                    if base_key.trim().is_empty() || foreign_key.trim().is_empty() {
+                        continue; // SUMIF-only tables; skip scalar join
+                    }
                     join_tpls.push(CalcJoinTemplate {
                         table_id: j.table_id.clone(),
                         sheet_name: right.name.clone(),
-                        base_key: j.base_key.clone(),
-                        foreign_key: j.foreign_key.clone(),
+                        base_key,
+                        foreign_key,
                         headers: right.headers.clone(),
                     });
                 }
+                // Auto-guess joins for formula tables (no longer configured in UI)
+                for tid in crate::ops::formulas_table_ids(
+                    calc_cols.iter().map(|c| c.formula.as_str()),
+                ) {
+                    if tid == *base_table_id {
+                        continue;
+                    }
+                    if join_tpls.iter().any(|j| j.table_id == tid) {
+                        continue;
+                    }
+                    let Some(right) = by_id.get(&tid) else {
+                        continue;
+                    };
+                    if let Some((bk, fk)) =
+                        crate::ops::guess_join_keys(&base.headers, &right.headers)
+                    {
+                        join_tpls.push(CalcJoinTemplate {
+                            table_id: tid,
+                            sheet_name: right.name.clone(),
+                            base_key: bk,
+                            foreign_key: fk,
+                            headers: right.headers.clone(),
+                        });
+                    }
+                }
+                let mut sheet_tpls = join_tpls.clone();
+                for tid in crate::ops::formulas_table_ids(
+                    calc_cols.iter().map(|c| c.formula.as_str()),
+                ) {
+                    if sheet_tpls.iter().any(|s| s.table_id == tid) {
+                        continue;
+                    }
+                    if let Some(r) = by_id.get(&tid) {
+                        sheet_tpls.push(CalcJoinTemplate {
+                            table_id: tid,
+                            sheet_name: r.name.clone(),
+                            base_key: String::new(),
+                            foreign_key: String::new(),
+                            headers: r.headers.clone(),
+                        });
+                    }
+                }
                 let mut headers = base.headers.clone();
-                headers.push(output_field.clone());
+                for c in &calc_cols {
+                    headers.push(c.output_field.clone());
+                }
                 calculate_tpl = Some(CalculateTemplate {
                     sheet_name: sheet_name.clone(),
                     base_sheet: base.name.clone(),
                     base_table_id: base_table_id.clone(),
                     base_headers: base.headers.clone(),
-                    output_field: output_field.clone(),
-                    formula: formula.clone(),
+                    columns: calc_cols
+                        .iter()
+                        .map(|c| CalcColumnTemplate {
+                            output_field: c.output_field.clone(),
+                            formula: c.formula.clone(),
+                        })
+                        .collect(),
                     joins: join_tpls,
+                    sheets: sheet_tpls,
                 });
                 by_id.insert(
                     step.output_table_id.clone(),
@@ -498,6 +682,9 @@ pub fn export_formula_template(pipeline: Pipeline, output_path: String) -> Resul
             Operation::Dedupe { .. } => {}
             Operation::SideBySide { .. } => {}
             Operation::Vlookup { .. } => {}
+            Operation::FullJoin { .. } => {}
+            Operation::Output { .. } => {}
+            Operation::Start { .. } => {}
         }
     }
 
@@ -527,6 +714,26 @@ pub fn load_scheme(app: AppHandle, id: String) -> Result<Pipeline, String> {
 #[tauri::command]
 pub fn save_scheme(app: AppHandle, pipeline: Pipeline) -> Result<Pipeline, String> {
     crate::schemes::save_scheme(&app, pipeline)
+}
+
+#[tauri::command]
+pub fn save_scheme_draft(app: AppHandle, pipeline: Pipeline) -> Result<(), String> {
+    crate::schemes::save_scheme_draft(&app, pipeline)
+}
+
+#[tauri::command]
+pub fn load_scheme_draft(app: AppHandle, id: String) -> Result<Option<Pipeline>, String> {
+    crate::schemes::load_scheme_draft(&app, &id)
+}
+
+#[tauri::command]
+pub fn has_scheme_draft(app: AppHandle, id: String) -> Result<bool, String> {
+    crate::schemes::has_scheme_draft(&app, &id)
+}
+
+#[tauri::command]
+pub fn clear_scheme_draft(app: AppHandle, id: String) -> Result<(), String> {
+    crate::schemes::clear_scheme_draft(&app, &id)
 }
 
 #[tauri::command]

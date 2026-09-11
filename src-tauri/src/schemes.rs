@@ -14,8 +14,18 @@ fn schemes_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+fn drafts_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = schemes_dir(app)?.join(".drafts");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
 fn scheme_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.json"))
+}
+
+fn draft_path(app: &AppHandle, id: &str) -> Result<PathBuf, String> {
+    Ok(drafts_dir(app)?.join(format!("{id}.json")))
 }
 
 pub fn list_schemes(app: &AppHandle) -> Result<Vec<SchemeSummary>, String> {
@@ -77,11 +87,53 @@ pub fn save_scheme(app: &AppHandle, mut pipeline: Pipeline) -> Result<Pipeline, 
     let path = scheme_path(&schemes_dir(app)?, &pipeline.id);
     let json = serde_json::to_string_pretty(&pipeline).map_err(|e| e.to_string())?;
     fs::write(&path, json).map_err(|e| e.to_string())?;
+    let _ = clear_scheme_draft(app, &pipeline.id);
     Ok(pipeline)
 }
 
 pub fn delete_scheme(app: &AppHandle, id: &str) -> Result<(), String> {
     let path = scheme_path(&schemes_dir(app)?, id);
+    if path.exists() {
+        fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    let _ = clear_scheme_draft(app, id);
+    Ok(())
+}
+
+/// 异常退出前的未保存草稿（与正式方案分开存放）
+pub fn save_scheme_draft(app: &AppHandle, mut pipeline: Pipeline) -> Result<(), String> {
+    if pipeline.id.trim().is_empty() {
+        return Err("方案 id 为空，无法写草稿".into());
+    }
+    if pipeline.name.trim().is_empty() {
+        pipeline.name = "未命名方案".into();
+    }
+    let path = draft_path(app, &pipeline.id)?;
+    let json = serde_json::to_string_pretty(&pipeline).map_err(|e| e.to_string())?;
+    fs::write(&path, json).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn load_scheme_draft(app: &AppHandle, id: &str) -> Result<Option<Pipeline>, String> {
+    let path = draft_path(app, id)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path).map_err(|e| format!("读取草稿失败: {e}"))?;
+    let mut pipeline: Pipeline =
+        serde_json::from_str(&text).map_err(|e| format!("解析草稿失败: {e}"))?;
+    if pipeline.id.is_empty() {
+        pipeline.id = id.to_string();
+    }
+    Ok(Some(pipeline))
+}
+
+pub fn has_scheme_draft(app: &AppHandle, id: &str) -> Result<bool, String> {
+    Ok(draft_path(app, id)?.exists())
+}
+
+pub fn clear_scheme_draft(app: &AppHandle, id: &str) -> Result<(), String> {
+    let path = draft_path(app, id)?;
     if path.exists() {
         fs::remove_file(&path).map_err(|e| e.to_string())?;
     }

@@ -35,10 +35,10 @@ fn header_format_rgb(rgb: u32, white_text: bool) -> Format {
     fmt
 }
 
-/// Distinct header colors for multi-table results (vlookup A/B, etc.).
-/// Order is shuffled each write so different tables get random colors.
+/// Distinct header colors for multi-table results (vlookup A/B, layout blocks, etc.).
+/// Order matches frontend PreviewTable palette (deterministic).
 fn header_color_palette() -> Vec<(u32, bool)> {
-    let mut palette = vec![
+    vec![
         (0xED7D31, true),  // orange
         (0x5B9BD5, true),  // blue
         (0x70AD47, true),  // green
@@ -49,22 +49,7 @@ fn header_color_palette() -> Vec<(u32, bool)> {
         (0xA9D08E, false), // light green
         (0xF4B183, false), // light orange
         (0x9DC3E6, false), // light blue
-    ];
-    // Fisher–Yates with time-based seed
-    let mut state = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(1)
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        | 1;
-    for i in (1..palette.len()).rev() {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1);
-        let j = (state >> 33) as usize % (i + 1);
-        palette.swap(i, j);
-    }
-    palette
+    ]
 }
 
 fn header_formats_for_columns(groups: &[u32], col_count: usize) -> Vec<Format> {
@@ -102,6 +87,14 @@ fn number_format() -> Format {
     Format::new().set_num_format("0.##########")
 }
 
+fn integer_format() -> Format {
+    Format::new().set_num_format("0")
+}
+
+fn is_whole_number(n: f64) -> bool {
+    n.is_finite() && (n.fract() == 0.0 || (n.round() - n).abs() < 1e-9)
+}
+
 /// Large IDs, leading zeros, scientific text → keep as original string.
 fn should_write_as_number(s: &str) -> Option<f64> {
     let t = s.trim();
@@ -127,11 +120,34 @@ fn should_write_as_number(s: &str) -> Option<f64> {
     Some(n)
 }
 
+/// 列名像工号/单号时强制按文本写入，避免 Excel 当数值处理。
+fn header_is_id_text(h: &str) -> bool {
+    const KEYS: &[&str] = &[
+        "单号",
+        "工号",
+        "编号",
+        "代码",
+        "编码",
+        "证件",
+        "身份证",
+        "账号",
+        "卡号",
+        "凭证号",
+        "保单号",
+        "原工号",
+    ];
+    KEYS.iter().any(|k| h.contains(k))
+}
+
 fn write_table(worksheet: &mut Worksheet, table: &DataTable) -> Result<(), String> {
     let header_fmts =
         header_formats_for_columns(&table.header_groups, table.headers.len());
     let text_fmt = text_format();
-    let num_fmt = number_format();
+    let int_fmt = integer_format();
+    // 勿对整数用 0.##########，Excel 会显示成「1.」
+    let dec_fmt = number_format();
+
+    let data_start_row: u32 = if table.headers.is_empty() { 0 } else { 1 };
 
     for (c, h) in table.headers.iter().enumerate() {
         let fmt = header_fmts.get(c).cloned().unwrap_or_else(header_format);
@@ -141,21 +157,50 @@ fn write_table(worksheet: &mut Worksheet, table: &DataTable) -> Result<(), Strin
     }
     for (r, row) in table.rows.iter().enumerate() {
         for (c, val) in row.iter().enumerate() {
-            let row_i = (r + 1) as u32;
+            let row_i = data_start_row + r as u32;
             let col_i = c as u16;
-            if let Some(n) = should_write_as_number(val) {
-                worksheet
-                    .write_with_format(row_i, col_i, n, &num_fmt)
-                    .map_err(|e| e.to_string())?;
-            } else {
-                worksheet
-                    .write_with_format(row_i, col_i, val.as_str(), &text_fmt)
-                    .map_err(|e| e.to_string())?;
+            let force_text = table
+                .headers
+                .get(c)
+                .map(|h| header_is_id_text(h))
+                .unwrap_or(false);
+            if !force_text {
+                if let Some(n) = should_write_as_number(val) {
+                    let fmt = if is_whole_number(n) {
+                        &int_fmt
+                    } else {
+                        &dec_fmt
+                    };
+                    worksheet
+                        .write_with_format(row_i, col_i, n, fmt)
+                        .map_err(|e| e.to_string())?;
+                    continue;
+                }
             }
+            worksheet
+                .write_with_format(row_i, col_i, val.as_str(), &text_fmt)
+                .map_err(|e| e.to_string())?;
         }
     }
 
-    if !table.headers.is_empty() {
+    // Re-style layout header bands (incl. mid-sheet table headers) to match source colors.
+    for band in &table.header_bands {
+        if band.groups.is_empty() {
+            continue;
+        }
+        let fmts = header_formats_for_columns(&band.groups, band.groups.len());
+        for (i, _) in band.groups.iter().enumerate() {
+            let excel_row = band.row as u32;
+            let excel_col = (band.col + i) as u16;
+            let val = cell_at(table, excel_row as usize, band.col + i);
+            let fmt = fmts.get(i).cloned().unwrap_or_else(header_format);
+            worksheet
+                .write_with_format(excel_row, excel_col, val.as_str(), &fmt)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    if !table.plain_sheet && !table.headers.is_empty() {
         let last_col = (table.headers.len() - 1) as u16;
         let last_row = table.rows.len() as u32;
         worksheet
@@ -167,6 +212,18 @@ fn write_table(worksheet: &mut Worksheet, table: &DataTable) -> Result<(), Strin
     }
     worksheet.autofit();
     Ok(())
+}
+
+fn cell_at(table: &DataTable, row: usize, col: usize) -> String {
+    if row == 0 {
+        return table.headers.get(col).cloned().unwrap_or_default();
+    }
+    table
+        .rows
+        .get(row - 1)
+        .and_then(|r| r.get(col))
+        .cloned()
+        .unwrap_or_default()
 }
 
 pub fn sanitize_sheet_name(name: &str) -> String {
@@ -312,8 +369,11 @@ pub struct FilterTemplate {
     pub sheet_name: String,
     pub data_sheet: String,
     pub headers: Vec<String>,
-    pub conditions: Vec<(String, String, String)>, // col, op, value
+    /// col, op, value, join (with previous; first ignored)
+    pub conditions: Vec<(String, String, String, String)>,
     pub data_rows: usize,
+    /// "and" | "or" (legacy all-or when no join=or)
+    pub match_mode: String,
 }
 
 pub struct PivotTemplate {
@@ -334,6 +394,7 @@ pub struct SortTemplate {
     pub keys: Vec<(String, bool)>,
 }
 
+#[derive(Clone)]
 pub struct CalcJoinTemplate {
     pub table_id: String,
     pub sheet_name: String,
@@ -342,14 +403,20 @@ pub struct CalcJoinTemplate {
     pub headers: Vec<String>,
 }
 
+pub struct CalcColumnTemplate {
+    pub output_field: String,
+    pub formula: String,
+}
+
 pub struct CalculateTemplate {
     pub sheet_name: String,
     pub base_sheet: String,
     pub base_table_id: String,
     pub base_headers: Vec<String>,
-    pub output_field: String,
-    pub formula: String,
+    pub columns: Vec<CalcColumnTemplate>,
     pub joins: Vec<CalcJoinTemplate>,
+    /// All tables that may appear in formulas (for SUMIF column ranges, etc.).
+    pub sheets: Vec<CalcJoinTemplate>,
 }
 
 pub struct NewPremiumTemplate {
@@ -391,7 +458,8 @@ fn write_filter_formulas(ws: &mut Worksheet, ft: &FilterTemplate) -> Result<(), 
     let end_col = col_letter(ft.headers.len().saturating_sub(1));
 
     let mut cond_parts = Vec::new();
-    for (col, op, value) in &ft.conditions {
+    let mut joins = Vec::new();
+    for (col, op, value, join) in &ft.conditions {
         let Some(idx) = ft.headers.iter().position(|h| h == col) else {
             continue;
         };
@@ -404,6 +472,11 @@ fn write_filter_formulas(ws: &mut Worksheet, ft: &FilterTemplate) -> Result<(), 
             "neq" => format!("{range}<>\"{value}\""),
             _ => continue,
         };
+        joins.push(if cond_parts.is_empty() {
+            "and".to_string()
+        } else {
+            join.clone()
+        });
         cond_parts.push(part);
     }
 
@@ -412,7 +485,26 @@ fn write_filter_formulas(ws: &mut Worksheet, ft: &FilterTemplate) -> Result<(), 
         ws.write_formula(1, 0, Formula::new(formula))
             .map_err(|e| e.to_string())?;
     } else {
-        let include = cond_parts.join("*");
+        let any_or = joins.iter().skip(1).any(|j| j.eq_ignore_ascii_case("or"));
+        let legacy_all_or = ft.match_mode.eq_ignore_ascii_case("or") && !any_or;
+        let include = if legacy_all_or {
+            cond_parts.join("+")
+        } else {
+            // Groups of AND (*) separated by OR (+)
+            let mut groups: Vec<String> = Vec::new();
+            let mut cur: Vec<String> = Vec::new();
+            for (i, part) in cond_parts.iter().enumerate() {
+                if i > 0 && joins[i].eq_ignore_ascii_case("or") && !cur.is_empty() {
+                    groups.push(cur.join("*"));
+                    cur = Vec::new();
+                }
+                cur.push(part.clone());
+            }
+            if !cur.is_empty() {
+                groups.push(cur.join("*"));
+            }
+            groups.join("+")
+        };
         let formula = format!(
             "=FILTER('{data_sheet}'!A2:{end_col}{end_row},({include}),\"\")"
         );
@@ -541,26 +633,36 @@ fn write_calculate_formulas(ws: &mut Worksheet, ct: &CalculateTemplate) -> Resul
     let base_sheet = sanitize_sheet_name(&ct.base_sheet);
     let header_fmt = header_format();
     let mut headers = ct.base_headers.clone();
-    headers.push(ct.output_field.clone());
+    for col in &ct.columns {
+        headers.push(col.output_field.clone());
+    }
     for (c, h) in headers.iter().enumerate() {
         ws.write_with_format(0, c as u16, h.as_str(), &header_fmt)
             .map_err(|e| e.to_string())?;
     }
-    if ct.base_headers.is_empty() {
+    if ct.base_headers.is_empty() || ct.columns.is_empty() {
         return Ok(());
     }
 
     const DATA_END: &str = "100000";
     let end_col = col_letter(ct.base_headers.len() - 1);
-    let row_expr = formula_refs_to_excel(
-        &ct.formula,
-        &ct.base_table_id,
-        &ct.base_headers,
-        &ct.joins,
-    )?;
+    let mut map_cols = Vec::new();
+    for col in &ct.columns {
+        let row_expr = formula_refs_to_excel(
+            &col.formula,
+            &ct.base_table_id,
+            &ct.base_headers,
+            &ct.joins,
+            &ct.sheets,
+        )?;
+        map_cols.push(format!(
+            "MAP(SEQUENCE(ROWS(base)),LAMBDA(i,{row_expr}))"
+        ));
+    }
 
     let formula = format!(
-        "=LET(base,FILTER('{base_sheet}'!A2:{end_col}{DATA_END},'{base_sheet}'!A2:A{DATA_END}<>\"\"),HSTACK(base,MAP(SEQUENCE(ROWS(base)),LAMBDA(i,{row_expr}))))"
+        "=LET(base,FILTER('{base_sheet}'!A2:{end_col}{DATA_END},'{base_sheet}'!A2:A{DATA_END}<>\"\"),HSTACK(base,{}))",
+        map_cols.join(",")
     );
     ws.write_formula(1, 0, Formula::new(formula))
         .map_err(|e| e.to_string())?;
@@ -573,11 +675,236 @@ fn formula_refs_to_excel(
     base_table_id: &str,
     base_headers: &[String],
     joins: &[CalcJoinTemplate],
+    sheets: &[CalcJoinTemplate],
 ) -> Result<String, String> {
     let expr = formula.trim().trim_start_matches('=').trim();
     if expr.is_empty() {
         return Err("计算公式不能为空".into());
     }
+    let with_agg = convert_range_agg_fns(expr, base_table_id, base_headers, sheets)?;
+    convert_scalar_refs(&with_agg, formula, base_table_id, base_headers, joins)
+}
+
+fn find_sheet<'a>(
+    tid: &str,
+    sheets: &'a [CalcJoinTemplate],
+) -> Option<&'a CalcJoinTemplate> {
+    sheets.iter().find(|s| s.table_id == tid)
+}
+
+fn col_full_range(sheet: &str, headers: &[String], col: &str) -> Result<String, String> {
+    let idx = headers
+        .iter()
+        .position(|h| h == col)
+        .ok_or_else(|| format!("表缺少列「{col}」"))?;
+    let cl = col_letter(idx);
+    Ok(format!("'{sheet}'!{cl}:{cl}"))
+}
+
+/// Convert SUMIF/COUNTIF/SUMIFS range args to Excel full-column refs; criteria keep `[...]` for later.
+fn convert_range_agg_fns(
+    expr: &str,
+    base_table_id: &str,
+    base_headers: &[String],
+    sheets: &[CalcJoinTemplate],
+) -> Result<String, String> {
+    let upper = expr.to_ascii_uppercase();
+    let names = ["SUMIFS", "COUNTIFS", "SUMIF", "COUNTIF"]; // longer first
+    let mut out = String::new();
+    let mut i = 0;
+    let chars: Vec<char> = expr.chars().collect();
+    while i < chars.len() {
+        let rest_upper = upper.get(i..).unwrap_or("");
+        let mut matched = None::<&str>;
+        for n in names {
+            if rest_upper.starts_with(n)
+                && chars
+                    .get(i + n.len())
+                    .map(|c| *c == '(' || c.is_whitespace())
+                    .unwrap_or(false)
+            {
+                matched = Some(n);
+                break;
+            }
+        }
+        let Some(fname) = matched else {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        };
+        // skip function name and whitespace to '('
+        i += fname.len();
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() || chars[i] != '(' {
+            out.push_str(fname);
+            continue;
+        }
+        i += 1; // past '('
+        let args_start = i;
+        let mut depth = 1usize;
+        while i < chars.len() && depth > 0 {
+            match chars[i] {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            if depth > 0 {
+                i += 1;
+            }
+        }
+        if depth != 0 {
+            return Err(format!("{fname} 括号未闭合"));
+        }
+        let args_raw: String = chars[args_start..i].iter().collect();
+        i += 1; // past ')'
+        let args = split_fn_args(&args_raw)?;
+        let converted = match fname {
+            "SUMIF" => {
+                if !(2..=3).contains(&args.len()) {
+                    return Err("SUMIF 需要 2～3 个参数".into());
+                }
+                let r1 = range_arg_to_excel(&args[0], base_table_id, base_headers, sheets)?;
+                let crit = args[1].trim().to_string();
+                if args.len() == 3 {
+                    let r2 = range_arg_to_excel(&args[2], base_table_id, base_headers, sheets)?;
+                    format!("SUMIF({r1},{crit},{r2})")
+                } else {
+                    format!("SUMIF({r1},{crit})")
+                }
+            }
+            "COUNTIF" => {
+                if args.len() != 2 {
+                    return Err("COUNTIF 需要 2 个参数".into());
+                }
+                let r1 = range_arg_to_excel(&args[0], base_table_id, base_headers, sheets)?;
+                format!("COUNTIF({r1},{})", args[1].trim())
+            }
+            "SUMIFS" => {
+                if args.len() < 3 || args.len() % 2 == 0 {
+                    return Err("SUMIFS 参数应为 sum_range, range_range, criteria, ...".into());
+                }
+                let mut parts = vec![range_arg_to_excel(
+                    &args[0],
+                    base_table_id,
+                    base_headers,
+                    sheets,
+                )?];
+                let mut k = 1;
+                while k + 1 < args.len() {
+                    parts.push(range_arg_to_excel(
+                        &args[k],
+                        base_table_id,
+                        base_headers,
+                        sheets,
+                    )?);
+                    parts.push(args[k + 1].trim().to_string());
+                    k += 2;
+                }
+                format!("SUMIFS({})", parts.join(","))
+            }
+            "COUNTIFS" => {
+                if args.len() < 2 || args.len() % 2 != 0 {
+                    return Err("COUNTIFS 参数应为 criteria_range, criteria, ...".into());
+                }
+                let mut parts = Vec::new();
+                let mut k = 0;
+                while k + 1 < args.len() {
+                    parts.push(range_arg_to_excel(
+                        &args[k],
+                        base_table_id,
+                        base_headers,
+                        sheets,
+                    )?);
+                    parts.push(args[k + 1].trim().to_string());
+                    k += 2;
+                }
+                format!("COUNTIFS({})", parts.join(","))
+            }
+            _ => unreachable!(),
+        };
+        out.push_str(&converted);
+    }
+    Ok(out)
+}
+
+fn split_fn_args(raw: &str) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    for c in raw.chars() {
+        if c == '"' {
+            in_str = !in_str;
+            cur.push(c);
+            continue;
+        }
+        if !in_str {
+            match c {
+                '(' | '[' => {
+                    depth += 1;
+                    cur.push(c);
+                }
+                ')' | ']' => {
+                    depth = depth.saturating_sub(1);
+                    cur.push(c);
+                }
+                ',' if depth == 0 => {
+                    args.push(cur.trim().to_string());
+                    cur.clear();
+                }
+                _ => cur.push(c),
+            }
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.trim().is_empty() {
+        args.push(cur.trim().to_string());
+    }
+    Ok(args)
+}
+
+fn range_arg_to_excel(
+    arg: &str,
+    base_table_id: &str,
+    base_headers: &[String],
+    sheets: &[CalcJoinTemplate],
+) -> Result<String, String> {
+    let a = arg.trim();
+    if !(a.starts_with('[') && a.ends_with(']')) {
+        return Err(format!(
+            "SUMIF/COUNTIF 区域须为 [表!列]，收到: {arg}"
+        ));
+    }
+    let inside = a[1..a.len() - 1].trim();
+    let (tid, col) = if let Some((t, c)) = inside.split_once('!') {
+        (t.trim(), c.trim())
+    } else {
+        (base_table_id, inside)
+    };
+    if tid == base_table_id {
+        let idx = base_headers
+            .iter()
+            .position(|h| h == col)
+            .ok_or_else(|| format!("基准表缺少列「{col}」"))?;
+        // Relative to spilled `base` array: whole column via INDEX
+        return Ok(format!("INDEX(base,0,{})", idx + 1));
+    }
+    let sheet = find_sheet(tid, sheets).ok_or_else(|| {
+        format!("公式引用了未知表「{tid}」（导出模板时需能追溯到该源表/步骤）")
+    })?;
+    col_full_range(&sanitize_sheet_name(&sheet.sheet_name), &sheet.headers, col)
+}
+
+fn convert_scalar_refs(
+    expr: &str,
+    original: &str,
+    base_table_id: &str,
+    base_headers: &[String],
+    joins: &[CalcJoinTemplate],
+) -> Result<String, String> {
     let mut out = String::new();
     let mut rest = expr;
     while let Some(start) = rest.find('[') {
@@ -585,7 +912,7 @@ fn formula_refs_to_excel(
         let after = &rest[start + 1..];
         let end = after
             .find(']')
-            .ok_or_else(|| format!("公式括号未闭合: {formula}"))?;
+            .ok_or_else(|| format!("公式括号未闭合: {original}"))?;
         let inside = after[..end].trim();
         let piece = if let Some((tid, col)) = inside.split_once('!') {
             let tid = tid.trim();
@@ -601,7 +928,11 @@ fn formula_refs_to_excel(
                 let join = joins
                     .iter()
                     .find(|j| j.table_id == tid)
-                    .ok_or_else(|| format!("公式引用了未关联的表「{tid}」"))?;
+                    .ok_or_else(|| {
+                        format!(
+                            "公式引用了未关联的表「{tid}」（标量引用需配置关联；整列请用 SUMIF）"
+                        )
+                    })?;
                 let sheet = sanitize_sheet_name(&join.sheet_name);
                 let bk = base_headers
                     .iter()

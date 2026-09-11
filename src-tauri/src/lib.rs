@@ -4,15 +4,18 @@ mod excel_io;
 mod folder_run;
 mod models;
 mod ops;
+mod runtime_params;
 mod schemes;
 mod shell_menu;
+mod source_match;
 mod writer;
 
 use commands::{
-    copy_scheme, delete_scheme, execute_pipeline, execute_scheme_in_folder, export_formula_template,
-    export_pipeline_file, export_scheme, import_scheme, list_schemes, load_scheme, peek_raw_sheet,
+    clear_scheme_draft, copy_scheme, delete_scheme, dir_exists, execute_pipeline,
+    execute_scheme_in_folder, export_formula_template, export_pipeline_file, export_scheme,
+    has_scheme_draft, import_scheme, list_schemes, load_scheme, load_scheme_draft, peek_raw_sheet,
     prepare_folder_run, preview_source_table, preview_step, rename_scheme, save_scheme,
-    scan_source_dir, sync_folder_context_menu, unregister_folder_context_menu,
+    save_scheme_draft, scan_source_dir, sync_folder_context_menu, unregister_folder_context_menu,
 };
 use serde::Serialize;
 use std::sync::Mutex;
@@ -92,6 +95,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             scan_source_dir,
+            dir_exists,
             preview_source_table,
             peek_raw_sheet,
             preview_step,
@@ -100,6 +104,10 @@ pub fn run() {
             list_schemes,
             load_scheme,
             save_scheme,
+            save_scheme_draft,
+            load_scheme_draft,
+            has_scheme_draft,
+            clear_scheme_draft,
             delete_scheme,
             rename_scheme,
             copy_scheme,

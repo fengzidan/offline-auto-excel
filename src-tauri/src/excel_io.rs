@@ -1,8 +1,9 @@
 use crate::models::DataTable;
-use calamine::{open_workbook_auto, Data, Reader};
+use calamine::{open_workbook_auto, Data, Dimensions, Reader, Sheets};
 use chrono::{Local, NaiveDate};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -370,8 +371,9 @@ pub fn read_excel_first_sheet(
     path: &Path,
     header_row: Option<usize>,
 ) -> Result<(DataTable, usize), String> {
-    let range = open_first_sheet_range(path)?;
-    let (headers, chosen, data_start) = resolve_headers_from_range(&range, header_row, path)?;
+    let (range, merges) = open_first_sheet_range(path)?;
+    let (headers, chosen, data_start) =
+        resolve_headers_from_range(&range, &merges, header_row, path)?;
     let width = headers.len();
     let mut rows = Vec::new();
     for (ri, row) in range.rows().enumerate() {
@@ -396,8 +398,9 @@ pub fn read_excel_preview(
     header_row: Option<usize>,
     limit: usize,
 ) -> Result<(DataTable, usize, usize), String> {
-    let range = open_first_sheet_range(path)?;
-    let (headers, chosen, data_start) = resolve_headers_from_range(&range, header_row, path)?;
+    let (range, merges) = open_first_sheet_range(path)?;
+    let (headers, chosen, data_start) =
+        resolve_headers_from_range(&range, &merges, header_row, path)?;
     let width = headers.len();
     let limit = limit.max(1);
     let mut rows = Vec::new();
@@ -433,8 +436,9 @@ pub fn scan_sheet_meta(
     path: &Path,
     header_row: Option<usize>,
 ) -> Result<(Vec<String>, usize, usize), String> {
-    let range = open_first_sheet_range(path)?;
-    let (headers, chosen, data_start) = resolve_headers_from_range(&range, header_row, path)?;
+    let (range, merges) = open_first_sheet_range(path)?;
+    let (headers, chosen, data_start) =
+        resolve_headers_from_range(&range, &merges, header_row, path)?;
     let width = headers.len();
     let mut row_count = 0usize;
     for (ri, row) in range.rows().enumerate() {
@@ -450,7 +454,7 @@ pub fn scan_sheet_meta(
 }
 
 pub fn peek_raw_rows(path: &Path, limit: usize) -> Result<(Vec<Vec<String>>, usize), String> {
-    let range = open_first_sheet_range(path)?;
+    let (range, _) = open_first_sheet_range(path)?;
     let total = range.height();
     let mut rows = Vec::new();
     for row in range.rows().take(limit.max(1)) {
@@ -459,7 +463,9 @@ pub fn peek_raw_rows(path: &Path, limit: usize) -> Result<(Vec<Vec<String>>, usi
     Ok((rows, total))
 }
 
-fn open_first_sheet_range(path: &Path) -> Result<calamine::Range<Data>, String> {
+fn open_first_sheet_range(
+    path: &Path,
+) -> Result<(calamine::Range<Data>, Vec<Dimensions>), String> {
     let mut workbook =
         open_workbook_auto(path).map_err(|e| format!("打开失败 {}: {e}", path.display()))?;
     let sheet_names = workbook.sheet_names().to_vec();
@@ -467,13 +473,72 @@ fn open_first_sheet_range(path: &Path) -> Result<calamine::Range<Data>, String> 
         .first()
         .ok_or_else(|| format!("文件无 sheet: {}", path.display()))?
         .clone();
-    workbook
+    let merges = sheet_merge_cells(&mut workbook, &sheet_name);
+    let mut range = workbook
         .worksheet_range(&sheet_name)
-        .map_err(|e| format!("读取 sheet 失败 {}: {e}", path.display()))
+        .map_err(|e| format!("读取 sheet 失败 {}: {e}", path.display()))?;
+    fill_merged_cells(&mut range, &merges);
+    Ok((range, merges))
+}
+
+/// xlsx / xls 可读合并区域；xlsb / ods 暂不支持则返回空。
+fn sheet_merge_cells<RS: Read + Seek>(
+    workbook: &mut Sheets<RS>,
+    sheet_name: &str,
+) -> Vec<Dimensions> {
+    match workbook {
+        Sheets::Xlsx(wb) => wb.merge_cells_by_sheet_name(sheet_name).unwrap_or_default(),
+        Sheets::Xls(wb) => wb.merge_cells_by_sheet_name(sheet_name).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// 将合并单元格左上角的值填到整块区域的空白格（Excel 只存左上角）。
+fn fill_merged_cells(range: &mut calamine::Range<Data>, merges: &[Dimensions]) {
+    if range.is_empty() || merges.is_empty() {
+        return;
+    }
+    let Some(origin) = range.start() else {
+        return;
+    };
+    let (height, width) = range.get_size();
+    for m in merges {
+        if m.start == m.end {
+            continue;
+        }
+        let Some(anchor) = range.get_value(m.start).cloned() else {
+            continue;
+        };
+        if matches!(anchor, Data::Empty) || cell_to_string(&anchor).trim().is_empty() {
+            continue;
+        }
+        for r in m.start.0..=m.end.0 {
+            for c in m.start.1..=m.end.1 {
+                if (r, c) == m.start {
+                    continue;
+                }
+                if r < origin.0 || c < origin.1 {
+                    continue;
+                }
+                let rel = ((r - origin.0) as usize, (c - origin.1) as usize);
+                if rel.0 >= height || rel.1 >= width {
+                    continue;
+                }
+                let blank = range
+                    .get(rel)
+                    .map(|d| matches!(d, Data::Empty) || cell_to_string(d).trim().is_empty())
+                    .unwrap_or(true);
+                if blank {
+                    range[rel] = anchor.clone();
+                }
+            }
+        }
+    }
 }
 
 fn resolve_headers_from_range(
     range: &calamine::Range<Data>,
+    _merges: &[Dimensions],
     header_row: Option<usize>,
     path: &Path,
 ) -> Result<(Vec<String>, usize, usize), String> {
@@ -510,7 +575,9 @@ fn resolve_headers_from_range(
         .rposition(|h| !h.trim().is_empty())
         .map(|i| i + 1)
         .unwrap_or(0);
-    let headers: Vec<String> = header_cells.into_iter().take(last_non_empty).collect();
+    let raw: Vec<String> = header_cells.into_iter().take(last_non_empty).collect();
+    // 单行横向合并表头填值后同名相连 → 拆成 表头_1、表头_2…
+    let headers = split_consecutive_merged_headers(&raw);
     let forced = header_row.is_some();
     if headers.is_empty() || (!forced && !looks_like_header(&headers)) {
         return Err(format!(
@@ -520,6 +587,59 @@ fn resolve_headers_from_range(
         ));
     }
     Ok((headers, chosen, header_idx + 1))
+}
+
+/// 同一表头行内，横向合并导致的连续同名列拆成 `名称_1`、`名称_2`…
+fn split_consecutive_merged_headers(headers: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(headers.len());
+    let mut i = 0;
+    while i < headers.len() {
+        let raw = headers[i].trim();
+        let mut j = i + 1;
+        while j < headers.len() && headers[j].trim() == raw {
+            j += 1;
+        }
+        let count = j - i;
+        let base = if raw.is_empty() {
+            "列".to_string()
+        } else {
+            raw.to_string()
+        };
+        if count == 1 {
+            out.push(if raw.is_empty() {
+                format!("列{}", i + 1)
+            } else {
+                base
+            });
+        } else {
+            for n in 1..=count {
+                out.push(format!("{base}_{n}"));
+            }
+        }
+        i = j;
+    }
+    // 非连续重名（两列都叫「岗位」）仍要能区分
+    uniquify_headers(out)
+}
+
+fn uniquify_headers(headers: Vec<String>) -> Vec<String> {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut out = Vec::with_capacity(headers.len());
+    for h in headers {
+        let base = if h.trim().is_empty() {
+            "列".to_string()
+        } else {
+            h
+        };
+        let n = seen.entry(base.clone()).or_insert(0);
+        *n += 1;
+        if *n == 1 {
+            out.push(base);
+        } else {
+            out.push(format!("{base}_{n}"));
+        }
+    }
+    out
 }
 
 fn cell_is_blank(cell: &Data) -> bool {
@@ -626,6 +746,7 @@ pub fn safe_numeric_key(s: &str) -> Option<String> {
 
 /// Scan directory. `header_overrides`: path -> 1-based header row.
 /// Files that fail header detection are still returned with `header_ok = false`.
+/// Only Excel files in the directory are recognized as sources (subfolders are ignored).
 pub fn scan_directory(
     dir: &Path,
     header_overrides: &HashMap<String, usize>,
@@ -635,7 +756,6 @@ pub fn scan_directory(
     }
 
     let mut files = Vec::new();
-    let mut dirs = Vec::new();
     for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
         let path = entry.map_err(|e| e.to_string())?.path();
         let name = path
@@ -646,29 +766,15 @@ pub fn scan_directory(
         if name.starts_with('.') {
             continue;
         }
-        if path.is_dir() {
-            dirs.push(path);
-        } else if is_excel(&path) {
+        if path.is_file() && is_excel(&path) {
             files.push(path);
         }
     }
     files.sort();
-    dirs.sort();
 
     let mut tables = Vec::new();
-    let mut used_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-
     for path in files {
-        let table = scan_file_table(&path, header_overrides)?;
-        used_ids.insert(table.id.clone());
-        tables.push(table);
-    }
-
-    for dir_path in dirs {
-        if let Some(table) = scan_folder_table(&dir_path, header_overrides, &used_ids)? {
-            used_ids.insert(table.id.clone());
-            tables.push(table);
-        }
+        tables.push(scan_file_table(&path, header_overrides)?);
     }
     Ok(tables)
 }
@@ -699,6 +805,8 @@ fn scan_file_table(
             kind: "file".into(),
             file_count: 1,
             sample_path: path_str,
+            matched_name: String::new(),
+            match_keyword: String::new(),
         }),
         Err(msg) => Ok(crate::models::SourceTable {
             id,
@@ -712,10 +820,14 @@ fn scan_file_table(
             kind: "file".into(),
             file_count: 1,
             sample_path: path_str,
+            matched_name: String::new(),
+            match_keyword: String::new(),
         }),
     }
 }
 
+/// 子文件夹累计表发现已停用（开始节点只识别 Excel 文件）；保留供预览/合并路径复用参考。
+#[allow(dead_code)]
 fn scan_folder_table(
     dir_path: &Path,
     header_overrides: &HashMap<String, usize>,
@@ -783,42 +895,78 @@ fn scan_folder_table(
         kind: "folder".into(),
         file_count,
         sample_path,
+        matched_name: String::new(),
+        match_keyword: String::new(),
     }))
 }
 
 pub fn apply_filter(
     table: &DataTable,
     conditions: &[crate::models::FilterCondition],
+    match_mode: &str,
 ) -> Result<DataTable, String> {
     let idxs: Vec<(usize, &crate::models::FilterCondition)> = conditions
         .iter()
+        .filter(|c| !c.column.trim().is_empty())
         .map(|c| Ok((table.col_index(&c.column)?, c)))
         .collect::<Result<Vec<_>, String>>()?;
 
-    let rows = table
-        .rows
-        .iter()
-        .filter(|row| {
-            idxs.iter().all(|(idx, cond)| {
-                let cell = row.get(*idx).map(|s| s.as_str()).unwrap_or("");
-                match cond.op.as_str() {
-                    "eq" => cell == cond.value,
-                    "neq" => cell != cond.value,
-                    "contains" => cell.contains(&cond.value),
-                    "not_contains" => !cell.contains(&cond.value),
-                    "empty" => cell.trim().is_empty(),
-                    "not_empty" => !cell.trim().is_empty(),
-                    _ => true,
+    let rows = if idxs.is_empty() {
+        table.rows.clone()
+    } else {
+        // Legacy: match_mode=or and no per-condition join=or → all OR.
+        // Otherwise: consecutive `and` form a group; groups are OR-ed.
+        let any_join_or = idxs
+            .iter()
+            .skip(1)
+            .any(|(_, c)| c.join.eq_ignore_ascii_case("or"));
+        let legacy_all_or = match_mode.eq_ignore_ascii_case("or") && !any_join_or;
+
+        table
+            .rows
+            .iter()
+            .filter(|row| {
+                let check = |idx: usize, cond: &crate::models::FilterCondition| {
+                    let cell = row.get(idx).map(|s| s.as_str()).unwrap_or("");
+                    match cond.op.as_str() {
+                        "eq" => cell == cond.value,
+                        "neq" => cell != cond.value,
+                        "contains" => cell.contains(&cond.value),
+                        "not_contains" => !cell.contains(&cond.value),
+                        "empty" => cell.trim().is_empty(),
+                        "not_empty" => !cell.trim().is_empty(),
+                        _ => true,
+                    }
+                };
+
+                if legacy_all_or {
+                    return idxs.iter().any(|(idx, cond)| check(*idx, cond));
                 }
+
+                let mut group_ok = true;
+                for (i, (idx, cond)) in idxs.iter().enumerate() {
+                    if i > 0 && cond.join.eq_ignore_ascii_case("or") {
+                        if group_ok {
+                            return true;
+                        }
+                        group_ok = true;
+                    }
+                    if !check(*idx, cond) {
+                        group_ok = false;
+                    }
+                }
+                group_ok
             })
-        })
-        .cloned()
-        .collect();
+            .cloned()
+            .collect()
+    };
 
     Ok(DataTable {
         headers: table.headers.clone(),
         rows,
         header_groups: table.header_groups.clone(),
+        plain_sheet: table.plain_sheet,
+        header_bands: table.header_bands.clone(),
     })
 }
 
@@ -896,13 +1044,16 @@ mod tests {
                     column: "二级机构".into(),
                     op: "not_contains".into(),
                     value: "江苏苏州支公司".into(),
-                },
+                                join: "and".into(),
+            },
                 FilterCondition {
                     column: "渠道".into(),
                     op: "not_contains".into(),
                     value: "DIY".into(),
-                },
+                                join: "and".into(),
+            },
             ],
+            "and",
         )
         .unwrap();
         assert_eq!(filtered.rows.len(), 2);
@@ -929,8 +1080,10 @@ mod tests {
         let added = apply_calculate(
             &tables,
             "tmp:p",
-            "新增保费",
-            "=[tmp:p!保费变化量不含税_求和]-[src:2025同月保费!保费]",
+            &[crate::models::CalcColumn {
+                output_field: "新增保费".into(),
+                formula: "=[tmp:p!保费变化量不含税_求和]-[src:2025同月保费!保费]".into(),
+            }],
             &[crate::models::CalcJoin {
                 table_id: "src:2025同月保费".into(),
                 base_key: "业务员代码".into(),
@@ -953,10 +1106,97 @@ mod tests {
                 column: "不存在的列".into(),
                 op: "eq".into(),
                 value: "x".into(),
+                            join: "and".into(),
             }],
+            "and",
         )
         .unwrap_err();
         assert!(err.contains("重新映射"));
+    }
+
+    #[test]
+    fn filter_or_match_mode() {
+        let t = sample_niche();
+        let filtered = apply_filter(
+            &t,
+            &[
+                FilterCondition {
+                    column: "渠道".into(),
+                    op: "contains".into(),
+                    value: "DIY".into(),
+                                join: "and".into(),
+            },
+                FilterCondition {
+                    column: "二级机构".into(),
+                    op: "contains".into(),
+                    value: "江苏苏州支公司".into(),
+                                join: "and".into(),
+            },
+            ],
+            "or",
+        )
+        .unwrap();
+        // OR: DIY rows OR 苏州 rows — more than AND would keep
+        assert!(!filtered.rows.is_empty());
+        let and_filtered = apply_filter(
+            &t,
+            &[
+                FilterCondition {
+                    column: "渠道".into(),
+                    op: "contains".into(),
+                    value: "DIY".into(),
+                                join: "and".into(),
+            },
+                FilterCondition {
+                    column: "二级机构".into(),
+                    op: "contains".into(),
+                    value: "江苏苏州支公司".into(),
+                                join: "and".into(),
+            },
+            ],
+            "and",
+        )
+        .unwrap();
+        assert!(filtered.rows.len() >= and_filtered.rows.len());
+    }
+
+    #[test]
+    fn filter_mixed_and_or_joins() {
+        let t = sample_niche();
+        // (渠道含DIY 且 机构含南京) 或 (机构含苏州)
+        let filtered = apply_filter(
+            &t,
+            &[
+                FilterCondition {
+                    column: "渠道".into(),
+                    op: "contains".into(),
+                    value: "DIY".into(),
+                    join: "and".into(),
+                },
+                FilterCondition {
+                    column: "二级机构".into(),
+                    op: "contains".into(),
+                    value: "江苏南京支公司".into(),
+                    join: "and".into(),
+                },
+                FilterCondition {
+                    column: "二级机构".into(),
+                    op: "contains".into(),
+                    value: "江苏苏州支公司".into(),
+                    join: "or".into(),
+                },
+            ],
+            "and",
+        )
+        .unwrap();
+        assert!(!filtered.rows.is_empty());
+        for row in &filtered.rows {
+            let org = row[0].as_str();
+            let ch = row[1].as_str();
+            let ok = (ch.contains("DIY") && org.contains("江苏南京支公司"))
+                || org.contains("江苏苏州支公司");
+            assert!(ok, "row={row:?}");
+        }
     }
 
     #[test]
@@ -980,6 +1220,10 @@ mod tests {
             header_rows: HashMap::new(),
             output_sheets: vec![],
             folder_merges: HashMap::new(),
+            flow_positions: HashMap::new(),
+            flow_edges: vec![],
+            source_matchers: vec![],
+            prompt_fields: vec![],
             steps: vec![
                 Step {
                     id: "1".into(),
@@ -992,13 +1236,16 @@ mod tests {
                                 column: "二级机构".into(),
                                 op: "not_contains".into(),
                                 value: "江苏苏州支公司".into(),
-                            },
+                                            join: "and".into(),
+            },
                             FilterCondition {
                                 column: "渠道".into(),
                                 op: "not_contains".into(),
                                 value: "DIY".into(),
-                            },
+                                            join: "and".into(),
+            },
                         ],
+                        match_mode: "and".into(),
                     },
                     result: Some(ResultSpec {
                         enabled: true,
@@ -1089,5 +1336,124 @@ mod tests {
         assert_eq!(safe_numeric_key(id), None);
         assert_eq!(match_key("1.0"), "1");
         assert_eq!(match_key("001"), "1");
+    }
+
+    #[test]
+    fn fill_merged_cells_vertical_and_horizontal() {
+        use calamine::Range;
+        // 机构列纵向合并两行；表头横向合并两列
+        let mut range = Range::new((0, 0), (2, 2));
+        range[(0, 0)] = Data::String("规模档次".into());
+        // (0,1) empty — horizontally merged with (0,0) conceptually for header span
+        range[(0, 2)] = Data::String("编制人数".into());
+        range[(1, 0)] = Data::String("南京中支".into());
+        range[(1, 1)] = Data::String("销售内勤".into());
+        range[(1, 2)] = Data::Float(3.0);
+        // (2,0) empty — vertically merged with (1,0)
+        range[(2, 1)] = Data::String("理赔".into());
+        range[(2, 2)] = Data::Float(2.0);
+
+        fill_merged_cells(
+            &mut range,
+            &[
+                Dimensions::new((0, 0), (0, 1)),
+                Dimensions::new((1, 0), (2, 0)),
+            ],
+        );
+
+        assert_eq!(
+            range.get((0, 1)).map(cell_to_string).as_deref(),
+            Some("规模档次")
+        );
+        assert_eq!(
+            range.get((2, 0)).map(cell_to_string).as_deref(),
+            Some("南京中支")
+        );
+        // 已有值不被覆盖
+        assert_eq!(
+            range.get((2, 1)).map(cell_to_string).as_deref(),
+            Some("理赔")
+        );
+    }
+
+    #[test]
+    fn split_consecutive_merged_headers_numbers_each_col() {
+        let raw = vec![
+            "机构".into(),
+            "规模档次".into(),
+            "规模档次".into(),
+            "规模档次".into(),
+            "岗位".into(),
+        ];
+        assert_eq!(
+            split_consecutive_merged_headers(&raw),
+            vec!["机构", "规模档次_1", "规模档次_2", "规模档次_3", "岗位"]
+        );
+    }
+
+    #[test]
+    fn read_excel_splits_single_row_merged_headers() {
+        use rust_xlsxwriter::{Format, Workbook};
+
+        let dir = std::env::temp_dir().join("ae_merge_header_split");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("headers.xlsx");
+
+        let mut workbook = Workbook::new();
+        let worksheet = workbook.add_worksheet();
+        let fmt = Format::new();
+        worksheet.write_string(0, 0, "机构").unwrap();
+        worksheet
+            .merge_range(0, 1, 0, 3, "规模档次", &fmt)
+            .unwrap();
+        worksheet.write_string(0, 4, "岗位").unwrap();
+        worksheet.write_string(1, 0, "南京").unwrap();
+        worksheet.write_string(1, 1, "a").unwrap();
+        worksheet.write_string(1, 2, "b").unwrap();
+        worksheet.write_string(1, 3, "c").unwrap();
+        worksheet.write_string(1, 4, "理赔").unwrap();
+        workbook.save(&path).unwrap();
+
+        let (table, _) = read_excel_first_sheet(&path, Some(1)).unwrap();
+        assert_eq!(
+            table.headers,
+            vec!["机构", "规模档次_1", "规模档次_2", "规模档次_3", "岗位"]
+        );
+        assert_eq!(table.rows[0], vec!["南京", "a", "b", "c", "理赔"]);
+    }
+
+    #[test]
+    fn read_excel_fills_merged_cells_from_xlsx() {
+        use rust_xlsxwriter::{Format, Workbook};
+
+        let dir = std::env::temp_dir().join("ae_merge_cell_fill");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("merged.xlsx");
+
+        let mut workbook = Workbook::new();
+        let worksheet = workbook.add_worksheet();
+        let fmt = Format::new();
+        // 表头
+        worksheet.write_string(0, 0, "中心").unwrap();
+        worksheet.write_string(0, 1, "岗位").unwrap();
+        worksheet.write_string(0, 2, "人数").unwrap();
+        // 纵向合并「南京中支」两行
+        worksheet
+            .merge_range(1, 0, 2, 0, "南京中支", &fmt)
+            .unwrap();
+        worksheet.write_string(1, 1, "销售内勤").unwrap();
+        worksheet.write_number(1, 2, 3.0).unwrap();
+        worksheet.write_string(2, 1, "理赔").unwrap();
+        worksheet.write_number(2, 2, 2.0).unwrap();
+        workbook.save(&path).unwrap();
+
+        let (table, _) = read_excel_first_sheet(&path, Some(1)).unwrap();
+        assert_eq!(table.headers, vec!["中心", "岗位", "人数"]);
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0][0], "南京中支");
+        assert_eq!(table.rows[1][0], "南京中支");
+        assert_eq!(table.rows[1][1], "理赔");
     }
 }

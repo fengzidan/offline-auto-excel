@@ -1,0 +1,228 @@
+{
+  "id": "b6893586-7861-432b-a03f-bf33478f642a",
+  "name": "人力分析",
+  "sourceDir": "",
+  "outputDir": "",
+  "headerRows": {},
+  "steps": [
+    {
+      "id": "15d35f25-3f4d-47b0-89de-9797ddbbab57",
+      "outputTableId": "tmp:15d35f25",
+      "result": {
+        "enabled": true,
+        "fileKey": "main",
+        "sheetName": "全量_机构岗位人数"
+      },
+      "name": "1.按机构岗位统计人数",
+      "operation": {
+        "type": "pivot",
+        "inputTableId": "src:人员清单",
+        "rowFields": [
+          "中心",
+          "一级部",
+          "岗位"
+        ],
+        "valueFields": [
+          {
+            "field": "员工工号",
+            "aggregation": "count",
+            "alias": "实际在岗人数"
+          }
+        ]
+      }
+    },
+    {
+      "id": "8b11270e-553d-4d14-98f3-e2bab64ceff5",
+      "outputTableId": "tmp:8b11270e",
+      "result": {
+        "enabled": false,
+        "fileKey": "main",
+        "sheetName": "分公司_人数"
+      },
+      "name": "2.筛选产险江苏分公司",
+      "operation": {
+        "type": "filter",
+        "inputTableId": "tmp:15d35f25",
+        "conditions": [
+          {
+            "column": "中心",
+            "op": "eq",
+            "value": "产险江苏分公司"
+          }
+        ]
+      }
+    },
+    {
+      "id": "7d586e9b-58cd-4472-a6bf-2b3462a36cab",
+      "outputTableId": "tmp:7d586e9b",
+      "result": {
+        "enabled": false,
+        "fileKey": "main",
+        "sheetName": "分公司_对接编制"
+      },
+      "name": "3.匹配分公司下发编制",
+      "operation": {
+        "type": "calculate",
+        "baseTableId": "tmp:8b11270e",
+        "columns": [
+          {
+            "outputField": "总公司下发编制",
+            "formula": "=SUMIFS([src:分公司下发编制!总公司下发编制],[src:分公司下发编制!部门],[一级部],[src:分公司下发编制!岗位],[岗位])"
+          }
+        ],
+        "joins": []
+      }
+    },
+    {
+      "id": "4a9369f3-99f9-4118-bda1-0f310f7870ad",
+      "outputTableId": "tmp:4a9369f3",
+      "result": {
+        "enabled": true,
+        "fileKey": "main",
+        "sheetName": "分公司_超编情况"
+      },
+      "name": "4.计算分公司超编",
+      "operation": {
+        "type": "calculate",
+        "baseTableId": "tmp:7d586e9b",
+        "columns": [
+          {
+            "outputField": "超编情况",
+            "formula": "=[实际在岗人数]-[总公司下发编制]"
+          }
+        ],
+        "joins": []
+      }
+    },
+    {
+      "id": "8418dbcd-dc49-49fc-a8a4-88374744905f",
+      "outputTableId": "tmp:8418dbcd",
+      "result": {
+        "enabled": false,
+        "fileKey": "main",
+        "sheetName": "中支_人数"
+      },
+      "name": "5.筛选中支机构人数",
+      "operation": {
+        "type": "filter",
+        "inputTableId": "tmp:15d35f25",
+        "conditions": [
+          {
+            "column": "中心",
+            "op": "neq",
+            "value": "产险江苏分公司"
+          }
+        ]
+      }
+    },
+    {
+      "id": "60d77e2d-5016-4c7d-a6ff-42aba3973712",
+      "outputTableId": "tmp:60d77e2d",
+      "result": {
+        "enabled": false,
+        "fileKey": "main",
+        "sheetName": "中支_对接保费"
+      },
+      "name": "6.对接中支保费计划",
+      "operation": {
+        "type": "vlookup",
+        "leftTableId": "tmp:8418dbcd",
+        "leftColumns": [
+          "中心",
+          "一级部",
+          "岗位",
+          "实际在岗人数"
+        ],
+        "lookups": [
+          {
+            "tableId": "src:中支保费",
+            "leftKey": "中心",
+            "rightKey": "机构",
+            "columns": [
+              "今年保费计划（万）",
+              "去年保费收入（万）"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "667fdaa9-431d-4d8e-9edf-dd642b2bb73a",
+      "outputTableId": "tmp:667fdaa9",
+      "result": {
+        "enabled": false,
+        "fileKey": "main",
+        "sheetName": "中支_规模档次"
+      },
+      "name": "7.计算保费规模档次",
+      "operation": {
+        "type": "calculate",
+        "baseTableId": "tmp:60d77e2d",
+        "columns": [
+          {
+            "outputField": "规模档次",
+            "formula": "=IF([今年保费计划（万）]<5000,\"5000万以下\",IF([今年保费计划（万）]<10000,\"5000-10000万\",\"10000万及以上\"))"
+          }
+        ],
+        "joins": []
+      }
+    },
+    {
+      "id": "1d30aed5-c791-428d-a14f-f7cbadefb975",
+      "outputTableId": "tmp:1d30aed5",
+      "result": {
+        "enabled": false,
+        "fileKey": "main",
+        "sheetName": "中支_应编人数"
+      },
+      "name": "8.匹配规模对应编制",
+      "operation": {
+        "type": "calculate",
+        "baseTableId": "tmp:667fdaa9",
+        "columns": [
+          {
+            "outputField": "应编人数",
+            "formula": "=SUMIFS([src:规模编制对照!编制人数],[src:规模编制对照!规模档次],[规模档次],[src:规模编制对照!岗位],[岗位])"
+          }
+        ],
+        "joins": []
+      }
+    },
+    {
+      "id": "d5c3092d-b382-4b45-9dea-9e4e8ec4584f",
+      "outputTableId": "tmp:d5c3092d",
+      "result": {
+        "enabled": true,
+        "fileKey": "main",
+        "sheetName": "中支_超少编情况"
+      },
+      "name": "9.计算中支超少编",
+      "operation": {
+        "type": "calculate",
+        "baseTableId": "tmp:1d30aed5",
+        "columns": [
+          {
+            "outputField": "超少编",
+            "formula": "=[实际在岗人数]-[应编人数]"
+          }
+        ],
+        "joins": []
+      }
+    }
+  ],
+  "outputSheets": [
+    {
+      "stepId": "15d35f25-3f4d-47b0-89de-9797ddbbab57",
+      "sheetName": "全量_机构岗位人数"
+    },
+    {
+      "stepId": "4a9369f3-99f9-4118-bda1-0f310f7870ad",
+      "sheetName": "分公司_超编情况"
+    },
+    {
+      "stepId": "d5c3092d-b382-4b45-9dea-9e4e8ec4584f",
+      "sheetName": "中支_超少编情况"
+    }
+  ],
+  "folderMerges": {}
+}

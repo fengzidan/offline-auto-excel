@@ -98,19 +98,37 @@ pub fn prepare_scheme_for_folder(
     pipeline.output_dir = folder_str;
 
     let meta = scan_directory(Path::new(&pipeline.source_dir), &pipeline.header_rows)?;
-    let present: HashSet<String> = meta.iter().map(|t| t.id.clone()).collect();
+    let meta = crate::source_match::apply_source_matchers(&meta, &pipeline.source_matchers);
+    let present: HashSet<String> = meta
+        .iter()
+        .filter(|t| t.header_ok && !t.path.is_empty())
+        .map(|t| t.id.clone())
+        .collect();
     let required = required_source_ids(&pipeline);
 
     let mut missing_tables: Vec<String> = required
         .iter()
         .filter(|id| !present.contains(*id))
-        .map(|id| id.strip_prefix("src:").unwrap_or(id).to_string())
+        .map(|id| {
+            pipeline
+                .source_matchers
+                .iter()
+                .find(|m| m.id == *id)
+                .map(|m| {
+                    if m.keyword.is_empty() {
+                        m.id.strip_prefix("src:").unwrap_or(&m.id).to_string()
+                    } else {
+                        format!("{}（关键字「{}」）", m.id.strip_prefix("src:").unwrap_or(&m.id), m.keyword)
+                    }
+                })
+                .unwrap_or_else(|| id.strip_prefix("src:").unwrap_or(id).to_string())
+        })
         .collect();
     missing_tables.sort();
 
     let mut header_unready: Vec<String> = meta
         .iter()
-        .filter(|t| required.contains(&t.id) && !t.header_ok)
+        .filter(|t| required.contains(&t.id) && !t.path.is_empty() && !t.header_ok)
         .map(|t| t.name.clone())
         .collect();
     header_unready.sort();
@@ -127,12 +145,13 @@ pub fn execute_scheme_in_folder(
     app: &tauri::AppHandle,
     scheme_id: &str,
     folder: &Path,
+    runtime_params: Option<&HashMap<String, String>>,
 ) -> Result<ExecuteResult, String> {
     let pipeline = crate::schemes::load_scheme(app, scheme_id)?;
     let prep = prepare_scheme_for_folder(pipeline, folder)?;
     if !prep.missing_tables.is_empty() {
         return Err(format!(
-            "当前文件夹中未找到方案所需的表（需与方案内文件同名）：{}",
+            "当前文件夹中未找到方案所需的表（可按关键字模糊匹配）：{}",
             prep.missing_tables.join("、")
         ));
     }
@@ -143,8 +162,13 @@ pub fn execute_scheme_in_folder(
         ));
     }
     // Persist remapped source_dir / output_dir / header_rows into the scheme
+    // (without substituting runtime params into saved scheme).
     let saved = crate::schemes::save_scheme(app, prep.pipeline)?;
-    crate::commands::run_pipeline_inner(saved)
+    let values = runtime_params.cloned().unwrap_or_default();
+    let fields = crate::runtime_params::collect_prompt_fields(&saved);
+    crate::runtime_params::validate_runtime_params(&fields, &values)?;
+    let ready = crate::runtime_params::apply_runtime_params(saved, &values);
+    crate::commands::run_pipeline_inner(Some(app), ready)
 }
 
 /// Resolve a path that may be relative to cwd.

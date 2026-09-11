@@ -12,6 +12,10 @@ export function scanSourceDir(path: string, headerRows: Record<string, number> =
   return invoke<SourceTable[]>("scan_source_dir", { path, headerRows });
 }
 
+export function dirExists(path: string) {
+  return invoke<boolean>("dir_exists", { path });
+}
+
 export function previewSourceTable(
   path: string,
   headerRow?: number | null,
@@ -35,8 +39,14 @@ export function previewStep(pipeline: Pipeline, stepId: string, limit = 30) {
   return invoke<PreviewData>("preview_step", { pipeline, stepId, limit });
 }
 
-export function executePipeline(pipeline: Pipeline) {
-  return invoke<ExecuteResult>("execute_pipeline", { pipeline });
+export function executePipeline(
+  pipeline: Pipeline,
+  runtimeParams?: Record<string, string>,
+) {
+  return invoke<ExecuteResult>("execute_pipeline", {
+    pipeline,
+    runtimeParams: runtimeParams ?? {},
+  });
 }
 
 export function exportFormulaTemplate(pipeline: Pipeline, outputPath: string) {
@@ -53,6 +63,22 @@ export function loadScheme(id: string) {
 
 export function saveScheme(pipeline: Pipeline) {
   return invoke<Pipeline>("save_scheme", { pipeline });
+}
+
+export function saveSchemeDraft(pipeline: Pipeline) {
+  return invoke<void>("save_scheme_draft", { pipeline });
+}
+
+export function loadSchemeDraft(id: string) {
+  return invoke<Pipeline | null>("load_scheme_draft", { id });
+}
+
+export function hasSchemeDraft(id: string) {
+  return invoke<boolean>("has_scheme_draft", { id });
+}
+
+export function clearSchemeDraft(id: string) {
+  return invoke<void>("clear_scheme_draft", { id });
 }
 
 export function deleteScheme(id: string) {
@@ -89,8 +115,16 @@ export function prepareFolderRun(schemeId: string, folder: string) {
   return invoke<FolderRunPrep>("prepare_folder_run", { schemeId, folder });
 }
 
-export function executeSchemeInFolder(schemeId: string, folder: string) {
-  return invoke<ExecuteResult>("execute_scheme_in_folder", { schemeId, folder });
+export function executeSchemeInFolder(
+  schemeId: string,
+  folder: string,
+  runtimeParams?: Record<string, string>,
+) {
+  return invoke<ExecuteResult>("execute_scheme_in_folder", {
+    schemeId,
+    folder,
+    runtimeParams: runtimeParams ?? {},
+  });
 }
 
 export function syncFolderContextMenu() {

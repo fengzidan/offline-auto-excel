@@ -1142,6 +1142,16 @@ select {
   color: var(--excel-deep);
 }
 
+.flow-issue-summary.has-missing {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger-soft) 92%, var(--panel));
+}
+
+.flow-issue-detail {
+  color: var(--danger);
+  opacity: 0.92;
+}
+
 .flow-issue-detail {
   padding-left: 0.85rem;
   color: color-mix(in srgb, var(--danger) 82%, var(--ink));
@@ -1483,6 +1493,31 @@ th {
   background: var(--excel-wash);
   border-style: dashed;
   border-color: var(--line-strong);
+}
+
+/* 必须写在 .rf-node.source 之后，否则基础样式会盖掉标红 */
+.rf-node.source.warn {
+  border-color: var(--excel);
+  background: var(--excel-wash);
+}
+
+.rf-node.source.missing,
+.rf-node.source.warn.missing {
+  border-style: solid;
+  border-color: var(--danger);
+  background: var(--danger-soft);
+  outline: 2px solid color-mix(in srgb, var(--danger) 45%, transparent);
+  outline-offset: 1px;
+}
+
+.rf-node.source.missing .rf-sub {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.rf-node.source.missing.active,
+.rf-node.source.warn.missing.active {
+  outline: 2px solid color-mix(in srgb, var(--danger) 55%, transparent);
 }
 
 .rf-node.field {

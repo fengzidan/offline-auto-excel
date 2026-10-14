@@ -336,7 +336,7 @@ function SourceNode({ data }: NodeProps<FlowNode>) {
       <div className="rf-top">
         <span className="rf-kicker">源表</span>
         {data.sourceMissing ? (
-          <span className="rf-flag warn">缺失</span>
+          <span className="rf-flag warn">找不到文件</span>
         ) : data.sourceWarn ? (
           <span className="rf-flag warn">表头</span>
         ) : null}
@@ -874,12 +874,14 @@ function FlowIssueSummary({
   return (
     <Panel
       position="bottom-left"
-      className="flow-issue-summary"
+      className={`flow-issue-summary${summary.sourceMissing > 0 ? " has-missing" : ""}`}
       aria-live="polite"
     >
       <div className="flow-issue-title">
         <span className="flow-issue-dot" aria-hidden />
-        <strong>流程未齐</strong>
+        <strong>
+          {summary.sourceMissing > 0 ? "源表缺失" : "流程未齐"}
+        </strong>
       </div>
       <div className="flow-issue-detail">{parts.join(" · ")}</div>
     </Panel>
@@ -1451,8 +1453,10 @@ function FlowCanvasInner({
           name: s.name,
           ok: s.headerOk,
           hr: s.headerRow,
+          path: s.path ?? "",
           mk: s.matchKeyword ?? "",
           mn: s.matchedName ?? "",
+          missing: isSourceFileMissing(s),
         })),
         promptFields,
         activeStepId,

@@ -50,27 +50,52 @@ export function scoreSourceKeyword(table: SourceTable, keyword: string): number 
   return 0;
 }
 
+function missingSourceStub(
+  m: SourceMatcher,
+  message: string,
+): SourceTable {
+  const id = m.id.trim();
+  const kw = m.keyword?.trim() || "";
+  const label =
+    m.label?.trim() || kw || id.replace(/^src:/, "") || id;
+  return {
+    id,
+    name: label,
+    path: "",
+    headers: [],
+    rowCount: 0,
+    headerRow: 1,
+    headerOk: false,
+    headerMessage: message,
+    kind: "file",
+    // 无关键字时仍写入占位，保证画布「缺失」提示能显示
+    matchKeyword: kw || label,
+    matchedName: "",
+  };
+}
+
 /**
  * Apply user-defined keywords: bind stable matcher.id to the best scanned table
- * whose name/path contains the keyword. Unmatched matchers become placeholders.
- * Unmatched scanned files are NOT returned (deleted / unused files stay gone
- * until the user explicitly refreshes the directory).
+ * whose name/path contains the keyword.
+ * - 方案已登记的源表（sourceMatchers）一律保留；找不到文件时变为「缺失」占位。
+ * - 目录里多出来的未登记文件不返回（除非用户点「刷新」重新识别）。
  */
 export function applySourceMatchers(
   scanned: SourceTable[],
   matchers: SourceMatcher[] | undefined,
 ): SourceTable[] {
-  const list = (matchers ?? []).filter((m) => m.keyword?.trim() && m.id?.trim());
+  const list = (matchers ?? []).filter((m) => m.id?.trim());
   if (list.length === 0) return [];
 
   // Longer keywords first, so "赔付支出明细" beats "赔付"
-  const ordered = [...list].sort(
-    (a, b) => b.keyword.trim().length - a.keyword.trim().length,
-  );
+  const withKw = list
+    .filter((m) => m.keyword?.trim())
+    .sort((a, b) => b.keyword.trim().length - a.keyword.trim().length);
   const claimed = new Set<string>();
   const bound: SourceTable[] = [];
+  const boundIds = new Set<string>();
 
-  for (const m of ordered) {
+  for (const m of withKw) {
     const kw = m.keyword.trim();
     let best: SourceTable | null = null;
     let bestScore = 0;
@@ -93,20 +118,19 @@ export function applySourceMatchers(
         matchKeyword: kw,
       });
     } else {
-      bound.push({
-        id: m.id,
-        name: m.label?.trim() || m.keyword.trim(),
-        path: "",
-        headers: [],
-        rowCount: 0,
-        headerRow: 1,
-        headerOk: false,
-        headerMessage: `未匹配到名称含「${kw}」的源表/文件夹`,
-        kind: "file",
-        matchKeyword: kw,
-        matchedName: "",
-      });
+      bound.push(
+        missingSourceStub(m, `未匹配到名称含「${kw}」的源表/文件夹`),
+      );
     }
+    boundIds.add(m.id.trim());
+  }
+
+  // 无关键字的已登记源表：仍保留节点并标缺失
+  for (const m of list) {
+    const id = m.id.trim();
+    if (boundIds.has(id)) continue;
+    bound.push(missingSourceStub(m, "未设置匹配关键字，找不到对应文件"));
+    boundIds.add(id);
   }
 
   return bound;
@@ -196,14 +220,20 @@ export function matchersEqual(
 
 /** 方案已登记但当前扫不到对应文件 */
 export function isSourceFileMissing(
-  s: Pick<SourceTable, "matchKeyword" | "matchedName"> & {
+  s: Pick<SourceTable, "id" | "matchKeyword" | "matchedName"> & {
     path?: string | null;
   },
 ): boolean {
+  const path = String(s.path ?? "").trim();
+  const matched = String(s.matchedName ?? "").trim();
   const kw = s.matchKeyword?.trim();
-  if (!kw) return false;
-  if (!String(s.matchedName ?? "").trim()) return true;
-  if (!String(s.path ?? "").trim()) return true;
+  // 已登记源表占位（无路径）一律视为缺失，保留画布红标提示
+  if (!path) {
+    if (kw) return true;
+    if (String(s.id ?? "").startsWith("src:")) return true;
+    return false;
+  }
+  if (kw && !matched) return true;
   return false;
 }
 
@@ -212,8 +242,9 @@ export function isSourceFileMissing(
  * 仅扫到、尚未配表头的不自动上画布。
  */
 export function shouldShowSourceOnCanvas(s: SourceTable): boolean {
+  if (isSourceFileMissing(s)) return true;
   if (s.headerOk) return true;
-  return isSourceFileMissing(s);
+  return false;
 }
 
 export function canvasSourceIds(sources: SourceTable[]): string[] {

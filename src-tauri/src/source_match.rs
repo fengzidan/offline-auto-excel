@@ -24,21 +24,59 @@ fn score_keyword(table: &SourceTable, keyword: &str) -> i32 {
     0
 }
 
+fn missing_stub(m: &SourceMatcher, message: String) -> SourceTable {
+    let id = m.id.trim().to_string();
+    let kw = m.keyword.trim().to_string();
+    let label = {
+        let l = m.label.trim();
+        if !l.is_empty() {
+            l.to_string()
+        } else if !kw.is_empty() {
+            kw.clone()
+        } else {
+            id.trim_start_matches("src:").to_string()
+        }
+    };
+    let match_kw = if kw.is_empty() { label.clone() } else { kw };
+    SourceTable {
+        id,
+        name: label,
+        path: String::new(),
+        headers: vec![],
+        row_count: 0,
+        header_row: 1,
+        header_ok: false,
+        header_message: message,
+        kind: "file".into(),
+        file_count: 0,
+        sample_path: String::new(),
+        matched_name: String::new(),
+        match_keyword: match_kw,
+    }
+}
+
 /// Bind stable matcher ids to scanned tables by fuzzy keyword on name/path.
-/// Unmatched scanned files are omitted — only scheme-registered matchers appear.
+/// Registered matchers always appear (missing file → placeholder). Extra scanned
+/// files without a matcher are omitted.
 pub fn apply_source_matchers(
     scanned: &[SourceTable],
     matchers: &[SourceMatcher],
 ) -> Vec<SourceTable> {
-    let mut list: Vec<&SourceMatcher> = matchers
+    let all: Vec<&SourceMatcher> = matchers
         .iter()
-        .filter(|m| !m.keyword.trim().is_empty() && !m.id.trim().is_empty())
+        .filter(|m| !m.id.trim().is_empty())
         .collect();
     // No matchers registered: keep raw scan (legacy schemes without sourceMatchers).
-    if list.is_empty() {
+    if all.is_empty() {
         return scanned.to_vec();
     }
-    list.sort_by(|a, b| {
+
+    let mut with_kw: Vec<&SourceMatcher> = all
+        .iter()
+        .copied()
+        .filter(|m| !m.keyword.trim().is_empty())
+        .collect();
+    with_kw.sort_by(|a, b| {
         b.keyword
             .trim()
             .chars()
@@ -49,8 +87,9 @@ pub fn apply_source_matchers(
     let mut claimed_ids: HashSet<String> = HashSet::new();
     let mut claimed_paths: HashSet<String> = HashSet::new();
     let mut bound: Vec<SourceTable> = Vec::new();
+    let mut bound_ids: HashSet<String> = HashSet::new();
 
-    for m in list {
+    for m in with_kw {
         let kw = m.keyword.trim();
         let mut best: Option<&SourceTable> = None;
         let mut best_score = 0;
@@ -82,30 +121,24 @@ pub fn apply_source_matchers(
             aliased.match_keyword = kw.to_string();
             bound.push(aliased);
         } else {
-            let display = {
-                let label = m.label.trim();
-                if !label.is_empty() {
-                    label.to_string()
-                } else {
-                    kw.to_string()
-                }
-            };
-            bound.push(SourceTable {
-                id: m.id.clone(),
-                name: display,
-                path: String::new(),
-                headers: vec![],
-                row_count: 0,
-                header_row: 1,
-                header_ok: false,
-                header_message: format!("未匹配到名称含「{kw}」的源表/文件夹"),
-                kind: "file".into(),
-                file_count: 0,
-                sample_path: String::new(),
-                matched_name: String::new(),
-                match_keyword: kw.to_string(),
-            });
+            bound.push(missing_stub(
+                m,
+                format!("未匹配到名称含「{kw}」的源表/文件夹"),
+            ));
         }
+        bound_ids.insert(m.id.trim().to_string());
+    }
+
+    for m in all {
+        let id = m.id.trim().to_string();
+        if bound_ids.contains(&id) {
+            continue;
+        }
+        bound.push(missing_stub(
+            m,
+            "未设置匹配关键字，找不到对应文件".into(),
+        ));
+        bound_ids.insert(id);
     }
 
     bound
@@ -191,5 +224,21 @@ mod tests {
         let out = apply_source_matchers(&scanned, &matchers);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "src:人员清单");
+    }
+
+    #[test]
+    fn keeps_missing_stub_when_file_not_found() {
+        let scanned = vec![table("a", "其它.xlsx", "/a/其它.xlsx")];
+        let matchers = vec![SourceMatcher {
+            id: "src:人员清单".into(),
+            keyword: "人员清单".into(),
+            label: "人员清单".into(),
+        }];
+        let out = apply_source_matchers(&scanned, &matchers);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "src:人员清单");
+        assert!(out[0].path.is_empty());
+        assert!(!out[0].header_ok);
+        assert!(out[0].header_message.contains("未匹配"));
     }
 }

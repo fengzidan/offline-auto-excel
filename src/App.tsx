@@ -36,7 +36,6 @@ import {
   executeSchemeInFolder,
   exportFormulaTemplate,
   exportPipelineFile,
-  exportScheme,
   importScheme,
   listSchemes,
   loadScheme,
@@ -54,6 +53,8 @@ import {
 } from "./api";
 import {
   createEmptyPipeline,
+  createGuideDemoPipeline,
+  GUIDE_DEMO_SCHEME_ID,
   createNicheDemoSteps,
   createStep,
   normalizePipeline,
@@ -77,7 +78,15 @@ import {
 } from "./types";
 import { StepsFlowchart, type FlowPlacementApi, beginStepDrag, endStepDrag } from "./StepsFlowchart";
 import { applyFlowLink, applyFlowUnlink, opAccent, syncIncomingEdgesForStep, syncAllIncomingEdges, syncStartSourceEdges, edgeSourceNodeId, stepInputIds, flowEdgesEqual, flowPositionsEqual, defaultStartPos, defaultSourcePos, FLOW_LAYOUT, findFreeFlowPosition } from "./flowOps";
-import { applySourceMatchers, upsertSourceMatcher, ensureSourceMatchers, defaultSourceKeyword, matchersEqual, canvasSourceIds } from "./sourceMatch";
+import {
+  applySourceMatchers,
+  upsertSourceMatcher,
+  ensureSourceMatchers,
+  defaultSourceKeyword,
+  matchersEqual,
+  canvasSourceIds,
+  sourceIdentityKeys,
+} from "./sourceMatch";
 import {
   buildImportSetupState,
   collectImportWarnings,
@@ -96,6 +105,7 @@ import {
   syncPromptFieldsFromSteps,
   validateRuntimeParams,
 } from "./runtimeParams";
+import { prunePipelineForExport } from "./pipelineExport";
 import "./App.css";
 
 const STEP_PALETTE: {
@@ -144,7 +154,7 @@ function clonePipeline(p: Pipeline): Pipeline {
   return structuredClone(p);
 }
 
-/** Persist header-row picks under path / matcher id / filename for export & reuse. */
+/** Persist header-row picks under path / matcher id / keyword / filename for export & reuse. */
 function mergeHeaderRowsFromSources(
   headerRows: Record<string, number> | undefined,
   sources: SourceTable[],
@@ -155,6 +165,8 @@ function mergeHeaderRowsFromSources(
     const row = t.headerRow;
     if (t.path?.trim()) next[t.path] = row;
     if (t.id?.trim()) next[t.id] = row;
+    const kw = t.matchKeyword?.trim();
+    if (kw) next[kw] = row;
     const base = (t.path || t.matchedName || t.name || "")
       .replace(/\\/g, "/")
       .split("/")
@@ -179,6 +191,8 @@ function headerRowEntriesForTable(
   const entries: Record<string, number> = {};
   if (table.path?.trim()) entries[table.path] = row;
   if (table.id?.trim()) entries[table.id] = row;
+  const kw = table.matchKeyword?.trim();
+  if (kw) entries[kw] = row;
   const base = (table.path || table.matchedName || table.name || "")
     .replace(/\\/g, "/")
     .split("/")
@@ -404,6 +418,334 @@ function FlowPaletteStepsHelp() {
   );
 }
 
+type GuideModalKind = "none" | "start" | "prompt" | "filter" | "output";
+
+type GuideTourStep = {
+  /** CSS selectors; precise=true 时只高亮第一个命中的元素 */
+  targets: string[];
+  title: string;
+  body: string;
+  precise?: boolean;
+  /** 进入该步时自动打开的配置弹窗 */
+  modal?: GuideModalKind;
+};
+
+const GUIDE_TOUR_STEPS: GuideTourStep[] = [
+  {
+    targets: [
+      '[data-guide="scheme-guide-demo"]',
+      '[data-guide="btn-new-scheme"]',
+    ],
+    title: "方案从这里开始",
+    body: "左侧是方案列表。已为你打开「入门示例」。也可以点「新建方案」自己建流程。",
+    precise: true,
+    modal: "none",
+  },
+  {
+    targets: ['[data-guide="modal-start"]', '[data-guide="node-start"]'],
+    title: "配置「开始」",
+    body: "已打开开始配置。在这里选择源表文件夹，系统会扫描 Excel；再确认每张表的表头在第几行。表认准后会出现在画布上。",
+    precise: true,
+    modal: "start",
+  },
+  {
+    targets: ['[data-guide="modal-prompt"]', '[data-guide="btn-add-prompt"]'],
+    title: "配置初始数据",
+    body: "已打开「月份」配置。名称会出现在流程引用里（如 ${月份}）；常用值可预填；勾选「每次生成都要填」后，点生成时会提醒填写。",
+    precise: true,
+    modal: "prompt",
+  },
+  {
+    targets: ['[data-guide="palette-filter"]'],
+    title: "添加加工步骤",
+    body: "从这里点选或拖「筛选」等到画布。示例里已经放好一个筛选步骤，还可继续加透视、计算等。",
+    precise: true,
+    modal: "none",
+  },
+  {
+    targets: ['[data-guide="modal-step"]', '[data-guide="node-filter"]'],
+    title: "配置筛选步骤",
+    body: "已打开筛选配置。选择上游表、设置筛选条件（可用 ${月份}）；需要导出时勾选「输出为 Sheet」。右侧可预览结果。",
+    precise: true,
+    modal: "filter",
+  },
+  {
+    targets: ['[data-guide="modal-output"]', '[data-guide="node-output"]'],
+    title: "配置输出",
+    body: "已打开输出配置。可调整要导出的 Sheet、改名和顺序，并指定结果保存文件夹。",
+    precise: true,
+    modal: "output",
+  },
+  {
+    targets: ['[data-guide="btn-generate"]'],
+    title: "生成结果",
+    body: "配置好后点「生成」。若有初始数据，会先弹出填写框（如月份）。源表文件夹选好后即可真正出表。",
+    precise: true,
+    modal: "none",
+  },
+];
+
+function GuideTour({
+  stepIndex,
+  onStepChange,
+  onClose,
+  onPrepareStep,
+}: {
+  stepIndex: number;
+  onStepChange: (index: number) => void;
+  onClose: () => void;
+  /** 换步前打开对应弹窗；返回后需再测一次高亮 */
+  onPrepareStep?: (index: number) => void;
+}) {
+  const [hole, setHole] = useState<{
+    top: number;
+    left: number;
+    width: number;
+    height: number;
+  } | null>(null);
+  const [tipPos, setTipPos] = useState<{ top: number; left: number } | null>(
+    null,
+  );
+  const tipRef = useRef<HTMLDivElement | null>(null);
+  const holeRef = useRef(hole);
+  holeRef.current = hole;
+  const tipPosRef = useRef(tipPos);
+  tipPosRef.current = tipPos;
+  const step = GUIDE_TOUR_STEPS[stepIndex];
+  const total = GUIDE_TOUR_STEPS.length;
+
+  const measure = useCallback(() => {
+    if (!step) return;
+    const hits: DOMRect[] = [];
+    for (const sel of step.targets) {
+      const el = document.querySelector(sel);
+      if (!el) continue;
+      let r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) continue;
+      if (step.precise) {
+        (el as HTMLElement).scrollIntoView({
+          block: "nearest",
+          inline: "nearest",
+        });
+        r = el.getBoundingClientRect();
+      }
+      hits.push(r);
+      if (step.precise) break;
+    }
+
+    let left = Infinity;
+    let top = Infinity;
+    let right = -Infinity;
+    let bottom = -Infinity;
+    for (const r of hits) {
+      left = Math.min(left, r.left);
+      top = Math.min(top, r.top);
+      right = Math.max(right, r.right);
+      bottom = Math.max(bottom, r.bottom);
+    }
+    const found = hits.length > 0;
+
+    const pad = step.precise ? 6 : 8;
+    const nextHole = found
+      ? {
+          top: Math.max(8, top - pad),
+          left: Math.max(8, left - pad),
+          width: Math.min(window.innerWidth - 16, right - left + pad * 2),
+          height: Math.min(window.innerHeight - 16, bottom - top + pad * 2),
+        }
+      : null;
+
+    const tipW = tipRef.current?.offsetWidth ?? 320;
+    const tipH = tipRef.current?.offsetHeight ?? 180;
+    const gap = 12;
+    let tipTop: number;
+    let tipLeft: number;
+    if (nextHole) {
+      // 弹窗较大时，说明放在弹窗右侧或下方空白处
+      tipTop = nextHole.top + 16;
+      tipLeft = nextHole.left + nextHole.width + gap;
+      if (tipLeft + tipW > window.innerWidth - 12) {
+        tipLeft = Math.max(12, nextHole.left);
+        tipTop = nextHole.top + nextHole.height + gap;
+      }
+      if (tipTop + tipH > window.innerHeight - 12) {
+        tipTop = Math.max(12, window.innerHeight - tipH - 12);
+      }
+    } else {
+      tipTop = Math.max(24, window.innerHeight / 2 - tipH / 2);
+      tipLeft = Math.max(24, window.innerWidth / 2 - tipW / 2);
+    }
+    if (tipLeft + tipW > window.innerWidth - 12) {
+      tipLeft = Math.max(12, window.innerWidth - tipW - 12);
+    }
+    if (tipLeft < 12) tipLeft = 12;
+
+    const prevHole = holeRef.current;
+    const holeChanged =
+      (!!nextHole !== !!prevHole) ||
+      (!!nextHole &&
+        !!prevHole &&
+        (Math.abs(nextHole.top - prevHole.top) > 0.5 ||
+          Math.abs(nextHole.left - prevHole.left) > 0.5 ||
+          Math.abs(nextHole.width - prevHole.width) > 0.5 ||
+          Math.abs(nextHole.height - prevHole.height) > 0.5));
+    if (holeChanged) setHole(nextHole);
+
+    const prevTip = tipPosRef.current;
+    if (
+      !prevTip ||
+      Math.abs(prevTip.top - tipTop) > 0.5 ||
+      Math.abs(prevTip.left - tipLeft) > 0.5
+    ) {
+      setTipPos({ top: tipTop, left: tipLeft });
+    }
+  }, [step]);
+
+  useLayoutEffect(() => {
+    onPrepareStep?.(stepIndex);
+  }, [stepIndex, onPrepareStep]);
+
+  useLayoutEffect(() => {
+    measure();
+    const timers = [50, 160, 320].map((ms) => window.setTimeout(measure, ms));
+    return () => {
+      for (const t of timers) window.clearTimeout(t);
+    };
+  }, [measure, stepIndex]);
+
+  useEffect(() => {
+    window.addEventListener("resize", measure);
+    window.addEventListener("scroll", measure, true);
+    return () => {
+      window.removeEventListener("resize", measure);
+      window.removeEventListener("scroll", measure, true);
+    };
+  }, [measure]);
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        onClose();
+      }
+      if (e.key === "ArrowRight" || e.key === "Enter") {
+        if (stepIndex < total - 1) onStepChange(stepIndex + 1);
+        else onClose();
+      }
+      if (e.key === "ArrowLeft" && stepIndex > 0) {
+        onStepChange(stepIndex - 1);
+      }
+    }
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+  }, [onClose, onStepChange, stepIndex, total]);
+
+  if (!step) return null;
+
+  const vw = typeof window !== "undefined" ? window.innerWidth : 0;
+  const vh = typeof window !== "undefined" ? window.innerHeight : 0;
+  const masks = hole
+    ? [
+        { top: 0, left: 0, width: vw, height: hole.top },
+        {
+          top: hole.top,
+          left: 0,
+          width: hole.left,
+          height: hole.height,
+        },
+        {
+          top: hole.top,
+          left: hole.left + hole.width,
+          width: Math.max(0, vw - hole.left - hole.width),
+          height: hole.height,
+        },
+        {
+          top: hole.top + hole.height,
+          left: 0,
+          width: vw,
+          height: Math.max(0, vh - hole.top - hole.height),
+        },
+      ]
+    : [{ top: 0, left: 0, width: vw, height: vh }];
+
+  return createPortal(
+    <div className="guide-tour" role="dialog" aria-modal="true" aria-label="操作指引">
+      <div className="guide-tour-masks" aria-hidden>
+        {masks.map((m, i) => (
+          <div
+            key={i}
+            className="guide-tour-mask-piece"
+            style={{
+              top: m.top,
+              left: m.left,
+              width: m.width,
+              height: m.height,
+            }}
+            onClick={onClose}
+          />
+        ))}
+      </div>
+      {hole && (
+        <div
+          className="guide-tour-ring"
+          style={{
+            top: hole.top,
+            left: hole.left,
+            width: hole.width,
+            height: hole.height,
+          }}
+        />
+      )}
+      <div
+        ref={tipRef}
+        className="guide-tour-tip"
+        style={
+          tipPos
+            ? { top: tipPos.top, left: tipPos.left }
+            : { top: "30%", left: "50%", transform: "translateX(-50%)" }
+        }
+      >
+        <div className="guide-tour-tip-head">
+          <strong>{step.title}</strong>
+          <span className="guide-tour-progress">
+            {stepIndex + 1} / {total}
+          </span>
+        </div>
+        <p>{step.body}</p>
+        <div className="guide-tour-actions">
+          <button type="button" className="ghost" onClick={onClose}>
+            跳过
+          </button>
+          <div className="guide-tour-actions-end">
+            {stepIndex > 0 && (
+              <button
+                type="button"
+                onClick={() => onStepChange(stepIndex - 1)}
+              >
+                上一步
+              </button>
+            )}
+            {stepIndex < total - 1 ? (
+              <button
+                type="button"
+                className="primary"
+                onClick={() => onStepChange(stepIndex + 1)}
+              >
+                下一步
+              </button>
+            ) : (
+              <button type="button" className="primary" onClick={onClose}>
+                完成
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
 function PreviewTable({ data }: { data: PreviewData | null }) {
   if (!data) return <div className="muted pad-sm">暂无预览</div>;
   const groups = data.headerGroups ?? [];
@@ -497,6 +839,15 @@ export default function App() {
   const [startSourceTabId, setStartSourceTabId] = useState<string | null>(null);
   const [matcherKeywordDraft, setMatcherKeywordDraft] = useState("");
   const scannedSourcesRef = useRef<SourceTable[]>([]);
+  /** Snapshot before import-setup so Cancel can discard the imported scheme. */
+  const importBackupRef = useRef<{
+    pipeline: Pipeline | null;
+    sources: SourceTable[];
+    dirty: boolean;
+    activeStepId: string | null;
+    importedId: string;
+    importedName: string;
+  } | null>(null);
   const flowPlacementRef = useRef<FlowPlacementApi | null>(null);
   /** 左侧步骤指针拖入画布（不依赖 HTML5 DnD） */
   const palettePointerDragRef = useRef<{
@@ -540,6 +891,7 @@ export default function App() {
     | { type: "import-setup"; setup: ImportSetupState }
     | null
   >(null);
+  const [guideStep, setGuideStep] = useState<number | null>(null);
   const [dialogInput, setDialogInput] = useState("未命名方案");
   const [runtimeParamDraft, setRuntimeParamDraft] = useState<
     Record<string, string>
@@ -841,15 +1193,17 @@ export default function App() {
 
   useEffect(() => {
     if (
-      !activeStepId &&
-      !activePromptFieldKey &&
-      !flowFullscreen &&
-      !sourceModalId &&
-      dialog?.type !== "next-step"
+      guideStep != null ||
+      (!activeStepId &&
+        !activePromptFieldKey &&
+        !flowFullscreen &&
+        !sourceModalId &&
+        dialog?.type !== "next-step")
     )
       return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        if (guideStep != null) return;
         if (editingStepName) return;
         if (dialog?.type === "next-step") {
           setDialog(null);
@@ -874,6 +1228,7 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
+    guideStep,
     activeStepId,
     activePromptFieldKey,
     flowFullscreen,
@@ -1183,7 +1538,13 @@ export default function App() {
     p: Pipeline,
     opts?: { ensureMatchers?: boolean },
   ): Promise<SourceTable[]> {
-    const ensureMatchers = opts?.ensureMatchers !== false;
+    // 仅「刷新」显式传 true 时重新登记目录里的全部源表；
+    // 方案尚无 matchers 时（首次选目录）也自动识别一次。
+    const hasMatchers = (p.sourceMatchers ?? []).some((m) => m.id?.trim());
+    const ensureMatchers =
+      opts?.ensureMatchers !== undefined
+        ? opts.ensureMatchers
+        : !hasMatchers;
     if (!p.sourceDir) {
       scannedSourcesRef.current = [];
       // 无文件夹时仍保留方案已登记源表（显示为缺失），除非用户手动删除
@@ -1228,11 +1589,11 @@ export default function App() {
       setError(null);
     });
     try {
-      const raw = await scanSourceDir(p.sourceDir, p.headerRows ?? {});
-      scannedSourcesRef.current = raw;
+      const scanned = await scanSourceDir(p.sourceDir, p.headerRows ?? {});
+      scannedSourcesRef.current = scanned;
       let matchers = p.sourceMatchers ?? [];
       if (ensureMatchers) {
-        const ensured = ensureSourceMatchers(raw, p.sourceMatchers);
+        const ensured = ensureSourceMatchers(scanned, p.sourceMatchers);
         if (!matchersEqual(p.sourceMatchers, ensured)) {
           // 自动补全关键字需落盘，否则改名后步骤引用会丢
           updatePipeline((prev) => ({ ...prev, sourceMatchers: ensured }), {
@@ -1241,7 +1602,7 @@ export default function App() {
           matchers = ensured;
         }
       }
-      const tables = applySourceMatchers(raw, matchers);
+      const tables = applySourceMatchers(scanned, matchers);
       setSources(tables);
       // 表头就绪或文件缺失的方案源表都留在画布上，并与开始节点连线
       updatePipeline(
@@ -1305,14 +1666,14 @@ export default function App() {
       const matched = tables.filter((t) => t.matchKeyword && t.matchedName).length;
       if (need.length) {
         setStatus(
-          `已扫描 ${raw.length} 张表，关键字绑定 ${matched}，${need.length} 张需在开始节点中指定表头后才会出现在画布`,
+          `已扫描 ${scanned.length} 张文件，方案登记 ${matched} 张，${need.length} 张需在开始节点中指定表头后才会出现在画布`,
         );
         setActiveSourceId(need[0].id);
       } else {
         setStatus(
           matched
-            ? `已扫描 ${raw.length} 张源表，关键字绑定 ${matched} 张（表头已就绪）`
-            : `已扫描 ${raw.length} 张源表（表头已就绪）`,
+            ? `目录 ${scanned.length} 个文件，方案登记 ${matched} 张源表（表头已就绪）`
+            : `已扫描 ${scanned.length} 个文件`,
         );
         if (!activeSourceId && tables[0]) setActiveSourceId(tables[0].id);
       }
@@ -1786,19 +2147,16 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      const out =
+      const raw =
         pipeline?.id === id
-          ? await exportPipelineFile(
-              {
-                ...pipeline,
-                headerRows: mergeHeaderRowsFromSources(
-                  pipeline.headerRows,
-                  sourcesRef.current,
-                ),
-              },
-              path,
-            )
-          : await exportScheme(id, path);
+          ? pipeline
+          : normalizePipelineWithMeta(await loadScheme(id)).pipeline;
+      // 仅当前打开方案有实时源表列表，可按画布可见源表裁剪；
+      // 未打开的方案只按步骤引用与开始连线保留源表配置。
+      const sourcesForExport =
+        pipeline?.id === id ? sourcesRef.current : null;
+      const pruned = prunePipelineForExport(raw, sourcesForExport);
+      const out = await exportPipelineFile(pruned, path);
       setStatus(`方案已导出：${out}`);
     } catch (e) {
       setError(String(e));
@@ -1817,6 +2175,12 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
+      const prevPipeline = pipelineRef.current
+        ? clonePipeline(pipelineRef.current)
+        : null;
+      const prevSources = [...sourcesRef.current];
+      const prevDirty = dirtyRef.current;
+      const prevActiveStepId = activeStepId;
       const { pipeline: imported, createdStartId } = normalizePipelineWithMeta(
         await importScheme(selected),
       );
@@ -1845,6 +2209,14 @@ export default function App() {
       const warnings = await collectImportWarnings(normalized);
       setActivePromptFieldKey(null);
       if (warnings.length > 0) {
+        importBackupRef.current = {
+          pipeline: prevPipeline,
+          sources: prevSources,
+          dirty: prevDirty,
+          activeStepId: prevActiveStepId,
+          importedId: normalized.id,
+          importedName: normalized.name,
+        };
         setActiveStepId(null);
         let setup = buildImportSetupState(normalized, warnings);
         setup = { ...setup, scanning: true };
@@ -1856,6 +2228,7 @@ export default function App() {
         setDialog({ type: "import-setup", setup });
         setStatus(`已导入「${imported.name}」，请完成路径与源表配置`);
       } else {
+        importBackupRef.current = null;
         setDialog(null);
         setActiveStepId(
           createdStartId && !startConfigured ? createdStartId : null,
@@ -1866,6 +2239,33 @@ export default function App() {
             : `已导入方案「${imported.name}」`,
         );
       }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function cancelImportSetup() {
+    const backup = importBackupRef.current;
+    importBackupRef.current = null;
+    setDialog(null);
+    setError(null);
+    if (!backup) return;
+    setBusy(true);
+    try {
+      await deleteScheme(backup.importedId);
+      await refreshSchemeList();
+      setPipeline(backup.pipeline);
+      clearPipelineHistory();
+      setSources(backup.sources);
+      scannedSourcesRef.current = backup.sources.filter((s) => s.path?.trim());
+      setDirty(backup.dirty);
+      setActiveStepId(backup.activeStepId);
+      setActiveSourceId(null);
+      setSourcePreview(null);
+      setStepPreview(null);
+      setStatus(`已取消导入「${backup.importedName}」`);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -1914,10 +2314,11 @@ export default function App() {
     await revalidateImportSetup(setup);
   }
 
-  async function applyImportSetup() {
+  async function applyImportSetup(force = false) {
     if (dialog?.type !== "import-setup" || !pipeline) return;
     const setup = dialog.setup;
-    if (!importSetupIsReady(setup)) {
+    if (setup.scanning) return;
+    if (!force && !importSetupIsReady(setup)) {
       const reasons = importSetupBlockingReasons(setup);
       setError(reasons[0] ?? "请先完成导入配置");
       return;
@@ -1949,9 +2350,14 @@ export default function App() {
         }),
       );
     });
+    importBackupRef.current = null;
     setDialog(null);
     setError(null);
-    setStatus(`已完成「${setup.schemeName}」导入配置`);
+    setStatus(
+      force
+        ? `已导入「${setup.schemeName}」（部分配置未完成，可稍后在开始/输出节点补全）`
+        : `已完成「${setup.schemeName}」导入配置`,
+    );
     const latest = pipelineRef.current;
     if (latest) await refreshSources(latest, { ensureMatchers: false });
   }
@@ -2517,7 +2923,7 @@ export default function App() {
   ) {
     const newKey = (next.label?.trim() || next.key.trim());
     if (!newKey) {
-      setError("显示名不能为空");
+      setError("名称不能为空");
       return;
     }
     const oldKey = originalKey.trim();
@@ -2525,7 +2931,7 @@ export default function App() {
       oldKey !== newKey &&
       (pipeline?.promptFields ?? []).some((f) => f.key.trim() === newKey)
     ) {
-      setError(`显示名「${newKey}」已存在`);
+      setError(`名称「${newKey}」已存在`);
       return;
     }
     updatePipeline((p) => {
@@ -2782,15 +3188,30 @@ export default function App() {
     setStepPreview(null);
   }
 
-  /** 手动删除画布上的源表节点（从方案 matchers 移除；文件缺失时也需手动删） */
+  /** 手动删除画布上的源表节点（从方案彻底移除，除非再点「刷新」重新识别） */
   function removeSources(ids: string[]) {
     if (!ids.length || !pipeline) return;
     const idSet = new Set(ids.filter(Boolean));
     if (idSet.size === 0) return;
+    const purgeKeys = new Set<string>();
+    for (const id of idSet) {
+      purgeKeys.add(id);
+      const table = sources.find((s) => s.id === id);
+      if (table) {
+        for (const k of sourceIdentityKeys(table)) purgeKeys.add(k);
+      }
+      const matcher = pipeline.sourceMatchers?.find((m) => m.id === id);
+      if (matcher?.keyword?.trim()) purgeKeys.add(matcher.keyword.trim());
+      if (matcher?.label?.trim()) purgeKeys.add(matcher.label.trim());
+    }
     updatePipeline((p) => {
       const sourceMatchers = (p.sourceMatchers ?? []).filter(
         (m) => !idSet.has(m.id),
       );
+      const headerRows = { ...(p.headerRows ?? {}) };
+      for (const k of purgeKeys) delete headerRows[k];
+      const folderMerges = { ...(p.folderMerges ?? {}) };
+      for (const id of idSet) delete folderMerges[id];
       const flowPositions = { ...(p.flowPositions ?? {}) };
       for (const id of idSet) delete flowPositions[id];
       let flowEdges = (p.flowEdges ?? []).filter(
@@ -2822,6 +3243,8 @@ export default function App() {
         ...p,
         steps,
         sourceMatchers,
+        headerRows,
+        folderMerges,
         flowPositions,
         flowEdges,
       };
@@ -2839,7 +3262,7 @@ export default function App() {
     if (startSourceTabId && idSet.has(startSourceTabId)) {
       setStartSourceTabId(null);
     }
-    setStatus("已删除源表节点");
+    setStatus("已删除源表（再点「刷新」才会重新识别目录中的全部文件）");
   }
 
   function linkStepInput(
@@ -3092,21 +3515,87 @@ export default function App() {
     setStatus("已填入示例步骤，请核对表与列");
   }
 
+  async function startGuideTour() {
+    setCtxMenu(null);
+    setDialog(null);
+    setActiveStepId(null);
+    setActivePromptFieldKey(null);
+    setSourceModalId(null);
+    setError(null);
+    try {
+      if (dirty && pipelineRef.current) {
+        await persistCurrentScheme({ quiet: true, force: true });
+      }
+      const demo = createGuideDemoPipeline();
+      const saved = await saveScheme(demo);
+      await refreshSchemeList();
+      await applyOpenedPipeline(saved);
+      // 等画布节点挂载后再开指引
+      window.setTimeout(() => setGuideStep(0), 120);
+      setStatus("已打开「入门示例」，可按指引操作");
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  const prepareGuideStep = useCallback((index: number) => {
+    const step = GUIDE_TOUR_STEPS[index];
+    const kind = step?.modal ?? "none";
+    setSourceModalId(null);
+    setDialog(null);
+    if (kind === "prompt") {
+      setActiveStepId(null);
+      setActivePromptFieldKey("月份");
+      return;
+    }
+    setActivePromptFieldKey(null);
+    if (kind === "start") {
+      setActiveStepId("guide-start");
+      return;
+    }
+    if (kind === "filter") {
+      setActiveStepId("guide-filter");
+      return;
+    }
+    if (kind === "output") {
+      setActiveStepId("guide-output");
+      return;
+    }
+    setActiveStepId(null);
+  }, []);
+
+  const closeGuideTour = useCallback(() => {
+    setGuideStep(null);
+    setActiveStepId(null);
+    setActivePromptFieldKey(null);
+    setSourceModalId(null);
+  }, []);
+
   return (
     <div className="app">
       <div className="main">
         <aside className="scheme-rail">
           <div className="rail-brand">
             <span className="brand-mark">AE</span>
-            <div>
+            <div className="rail-brand-text">
               <h1>Auto Excel</h1>
-              <p>本地离线编排</p>
+              <div className="rail-brand-sub">
+                <p>本地离线编排</p>
+                <button
+                  type="button"
+                  className="rail-guide-link"
+                  onClick={() => void startGuideTour()}
+                >
+                  操作指引
+                </button>
+              </div>
             </div>
           </div>
-          <div className="rail-actions">
+          <div className="rail-actions" data-guide="schemes">
             <button
               type="button"
               className="primary"
+              data-guide="btn-new-scheme"
               onClick={() => void handleNewScheme()}
             >
               新建方案
@@ -3114,12 +3603,13 @@ export default function App() {
             <button
               type="button"
               disabled={busy}
+              data-guide="btn-import-scheme"
               onClick={() => void handleImportScheme()}
             >
               导入方案
             </button>
           </div>
-          <div className="scheme-list">
+          <div className="scheme-list" data-guide="scheme-list">
             {schemes.length === 0 && (
               <div className="muted pad-sm">暂无方案，点击上方「新建方案」</div>
             )}
@@ -3129,6 +3619,9 @@ export default function App() {
                 className={`scheme-item ${pipeline?.id === s.id ? "active" : ""} ${
                   ctxMenu?.id === s.id ? "menu-open" : ""
                 }`}
+                data-guide={
+                  s.id === GUIDE_DEMO_SCHEME_ID ? "scheme-guide-demo" : undefined
+                }
               >
                 <button
                   type="button"
@@ -3175,9 +3668,9 @@ export default function App() {
           </div>
         </aside>
 
-        <section className="workspace">
+        <section className="workspace" data-guide="workspace">
           {!pipeline ? (
-            <div className="empty-state">
+            <div className="empty-state" data-guide="canvas">
               <h2>选择或新建方案</h2>
               <p>先选一个方案，再配置源表和加工步骤，最后生成结果表。</p>
             </div>
@@ -3186,7 +3679,7 @@ export default function App() {
               <div
                 className={`flow-workspace${flowFullscreen ? " is-fullscreen" : ""}`}
               >
-                <aside className="flow-palette">
+                <aside className="flow-palette" data-guide="palette">
                   <div className="flow-palette-section">
                     <div className="flow-palette-title">方案名称</div>
                     <input
@@ -3199,7 +3692,7 @@ export default function App() {
                     />
                   </div>
 
-                  <div className="flow-palette-section">
+                  <div className="flow-palette-section" data-guide="prompt-fields">
                     <div className="flow-palette-title">初始数据</div>
                     <p className="flow-palette-hint muted">
                       每次跑报表可能不同的参数，例如「月份」「机构」。在筛选或计算里写{" "}
@@ -3209,6 +3702,7 @@ export default function App() {
                     <button
                       type="button"
                       className="prompt-field-add"
+                      data-guide="btn-add-prompt"
                       onClick={() => addPromptField()}
                     >
                       添加初始数据
@@ -3255,7 +3749,7 @@ export default function App() {
                     )}
                   </div>
 
-                  <div className="flow-palette-section grow">
+                  <div className="flow-palette-section grow" data-guide="steps">
                     <div className="flow-palette-title-row">
                       <div className="flow-palette-title">步骤</div>
                       <FlowPaletteStepsHelp />
@@ -3270,6 +3764,7 @@ export default function App() {
                           role="button"
                           tabIndex={0}
                           className="flow-palette-step"
+                          data-guide={`palette-${item.type}`}
                           title={item.tip}
                           style={{
                             ["--flow-accent" as string]: opAccent(item.type),
@@ -3327,6 +3822,7 @@ export default function App() {
                       <button
                         type="button"
                         className="flow-fs-btn primary"
+                        data-guide="btn-save"
                         disabled={!pipeline || busy}
                         title="保存方案（有修改时约每 5 秒自动保存；⌘S 立即保存）"
                         onClick={() => void handleSave()}
@@ -3336,6 +3832,7 @@ export default function App() {
                       <button
                         type="button"
                         className="flow-fs-btn primary"
+                        data-guide="btn-generate"
                         disabled={!pipeline || busy}
                         title="生成结果"
                         onClick={() => beginExecute()}
@@ -3366,6 +3863,7 @@ export default function App() {
                   </div>
                   <div
                     className={`steps-body ${stepPreview && !activeStep ? "with-preview" : ""}`}
+                    data-guide="canvas"
                   >
                     <StepsFlowchart
                       steps={pipeline.steps}
@@ -3630,10 +4128,14 @@ export default function App() {
                 return (
                   <div
                     className="step-modal-backdrop"
-                    onClick={() => setActivePromptFieldKey(null)}
+                    onClick={() => {
+                      if (guideStep != null) return;
+                      setActivePromptFieldKey(null);
+                    }}
                   >
                     <div
                       className={`step-modal prompt-field-modal${flowFullscreen ? " step-modal-fs" : ""}`}
+                      data-guide="modal-prompt"
                       onClick={(e) => e.stopPropagation()}
                       role="dialog"
                       aria-modal="true"
@@ -3642,11 +4144,7 @@ export default function App() {
                       <div className="editor-toolbar">
                         <div className="editor-toolbar-title">
                           <strong>初始数据</strong>
-                          <span className="muted">
-                            {promptPlaceholder(
-                              field.label?.trim() || field.key,
-                            )}
-                          </span>
+                          <span className="muted">跑报表前填写的业务参数</span>
                         </div>
                         <button
                           type="button"
@@ -3657,7 +4155,7 @@ export default function App() {
                           ×
                         </button>
                       </div>
-                      <div className="step-modal-body">
+                      <div className="step-modal-body prompt-field-modal-body">
                         <PromptFieldEditor
                           field={field}
                           onSave={(next) => {
@@ -3676,7 +4174,10 @@ export default function App() {
       {activeStep && (
                 <div
                   className="step-modal-backdrop"
-                  onClick={() => requestCloseStepModal()}
+                  onClick={() => {
+                    if (guideStep != null) return;
+                    requestCloseStepModal();
+                  }}
                 >
                   <div
                     className={`step-modal${flowFullscreen ? " step-modal-fs" : ""}${
@@ -3684,6 +4185,13 @@ export default function App() {
                         ? " start-config-modal"
                         : ""
                     }`}
+                    data-guide={
+                      activeStep.operation.type === "start"
+                        ? "modal-start"
+                        : activeStep.operation.type === "output"
+                          ? "modal-output"
+                          : "modal-step"
+                    }
                     onClick={(e) => e.stopPropagation()}
                     role="dialog"
                     aria-modal="true"
@@ -3884,8 +4392,11 @@ export default function App() {
                                     flushSync(() => {
                                       setScanning(true);
                                     });
-                                    void refreshSources(pipeline);
+                                    void refreshSources(pipeline, {
+                                      ensureMatchers: true,
+                                    });
                                   }}
+                                  title="重新扫描目录并识别全部源表（已删除的也会重新出现）"
                                 >
                                   {scanning ? "扫描中" : "刷新"}
                                 </button>
@@ -3895,8 +4406,8 @@ export default function App() {
                               {scanning
                                 ? "正在识别文件夹里的表格，文件较多时请稍候…"
                                 : sources.length === 0
-                                  ? "选好文件夹后会自动找出里面的业务表；有新增文件时点「刷新」。"
-                                  : `已找到 ${sources.length} 张源表，请逐个确认表头`}
+                                  ? "选好文件夹后会自动找出里面的业务表；有新增或需重新识别时点「刷新」。"
+                                  : `已登记 ${sources.length} 张源表；删除后不会自动回来，需点「刷新」才会重新识别目录`}
                             </p>
                           </div>
 
@@ -3915,7 +4426,8 @@ export default function App() {
                               </div>
                             </div>
                           ) : (
-                            sources.length > 0 && (
+                            <>
+                            {sources.length > 0 && (
                             <>
                               <div
                                 className="start-source-tabs"
@@ -4125,7 +4637,8 @@ export default function App() {
                                 );
                               })()}
                             </>
-                            )
+                            )}
+                            </>
                           )}
                         </div>
                       ) : (
@@ -4141,7 +4654,10 @@ export default function App() {
                             onPickOutputDir={() => void pickOutputDir()}
                             onPickSourceDir={() => void pickSourceDir()}
                             onRefreshSources={() => {
-                              if (pipeline) void refreshSources(pipeline);
+                              if (pipeline)
+                                void refreshSources(pipeline, {
+                                  ensureMatchers: true,
+                                });
                             }}
                             sourceScanning={scanning}
                             sourceCount={sources.length}
@@ -4214,6 +4730,15 @@ export default function App() {
         <span>{busy ? "处理中…" : scanning ? "扫描源表…" : status}</span>
         {error && <span className="error">{error}</span>}
       </footer>
+
+      {guideStep != null && (
+        <GuideTour
+          stepIndex={guideStep}
+          onStepChange={setGuideStep}
+          onClose={closeGuideTour}
+          onPrepareStep={prepareGuideStep}
+        />
+      )}
 
       {ctxMenu && (
         <div
@@ -4504,7 +5029,7 @@ export default function App() {
                 <h3>导入配置</h3>
                 <p className="modal-text">
                   方案「{dialog.setup.schemeName}」已导入。请重新指定本次用的文件夹，并按实际文件名调整认表关键字；
-                  <b>方案里要哪些源表不能增减</b>，须全部对上实际文件后才能继续。
+                  <b>方案里要哪些源表不能增减</b>。全部对上后点「完成配置」；若暂时对不上，可点「仍然导入」稍后在开始节点补全。
                 </p>
                 {dialog.setup.warnings.length > 0 && (
                   <ul className="import-warning-list">
@@ -4634,11 +5159,28 @@ export default function App() {
                 <div className="modal-actions">
                   <button
                     type="button"
+                    disabled={busy}
+                    onClick={() => void cancelImportSetup()}
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="button"
                     disabled={dialog.setup.scanning || busy}
                     onClick={() => void revalidateImportSetup()}
                   >
                     重新校验
                   </button>
+                  {!importSetupIsReady(dialog.setup) && (
+                    <button
+                      type="button"
+                      disabled={dialog.setup.scanning || busy}
+                      onClick={() => void applyImportSetup(true)}
+                      title="目录或源表未全部就绪时仍可先导入，稍后在方案里补全"
+                    >
+                      仍然导入
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="primary"
@@ -4647,7 +5189,7 @@ export default function App() {
                       dialog.setup.scanning ||
                       busy
                     }
-                    onClick={() => void applyImportSetup()}
+                    onClick={() => void applyImportSetup(false)}
                   >
                     完成配置
                   </button>
@@ -4684,58 +5226,69 @@ function PromptFieldEditor({
 
   return (
     <div className="prompt-field-editor">
-      <div className="prompt-field-editor-grid">
-        <label>
-          显示名
+      <div className="prompt-field-editor-preview" aria-hidden={!name}>
+        <span className="prompt-field-editor-preview-label">流程里写成</span>
+        <code className="prompt-field-token">{promptPlaceholder(name)}</code>
+      </div>
+
+      <div className="prompt-field-editor-fields">
+        <label className="prompt-field-editor-field">
+          <span>名称</span>
           <input
             value={label}
             onChange={(e) => setLabel(e.target.value)}
-            placeholder="如 月份"
-            title="流程中写成 ${显示名}"
+            placeholder="如 月份、机构"
+            title="流程里写成 ${名称}"
+            autoFocus
           />
         </label>
-        <label>
-          默认值
+        <label className="prompt-field-editor-field">
+          <span>常用值</span>
           <input
             value={defaultValue}
             onChange={(e) => setDefaultValue(e.target.value)}
-            placeholder="可不填"
+            placeholder="可不填，生成时再输入"
           />
         </label>
-        <label className="check-row prompt-field-editor-required">
+        <label className="prompt-field-editor-required">
           <input
             type="checkbox"
             checked={required}
             onChange={(e) => setRequired(e.target.checked)}
           />
-          执行前必须填写
+          <span className="prompt-field-editor-required-text">
+            <strong>每次生成都要填</strong>
+            <em>勾选后，点生成时若未填会提醒</em>
+          </span>
         </label>
       </div>
-      <p className="hint prompt-field-editor-hint">
-        适合「月份」「机构」等每次跑报表可能变化的内容。在筛选条件或计算公式里写{" "}
-        <code>{promptPlaceholder(name)}</code>
-        ，点生成时再填写本次要用的值。
+
+      <p className="prompt-field-editor-hint">
+        适合「月份」「机构」等每次跑报表可能变化的内容。在筛选或计算公式里写入上方引用，点生成时再填本次要用的值。
       </p>
-      <div className="modal-actions prompt-field-editor-actions">
+
+      <div className="prompt-field-editor-actions">
         {onDelete && (
-          <button type="button" className="danger" onClick={onDelete}>
+          <button type="button" className="danger ghost" onClick={onDelete}>
             删除
           </button>
         )}
-        <button
-          type="button"
-          className="primary"
-          onClick={() =>
-            onSave({
-              key: name,
-              label: name,
-              defaultValue,
-              required,
-            })
-          }
-        >
-          保存
-        </button>
+        <div className="prompt-field-editor-actions-end">
+          <button
+            type="button"
+            className="primary"
+            onClick={() =>
+              onSave({
+                key: name,
+                label: name,
+                defaultValue,
+                required,
+              })
+            }
+          >
+            保存
+          </button>
+        </div>
       </div>
     </div>
   );

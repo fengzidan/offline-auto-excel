@@ -90,11 +90,43 @@ pub fn remap_header_rows(
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_string();
-        let row = by_name
+        let mut row = by_name
             .get(&name)
             .or_else(|| by_name.get(&stem))
             .or_else(|| by_name.get(&format!("src:{stem}")))
             .copied();
+        // Copy-pasted files with same keyword (人员清单 → 人员清单 - 副本)
+        if row.is_none() {
+            let name_l = name.to_lowercase();
+            let stem_l = stem.to_lowercase();
+            let mut best: Option<(usize, usize)> = None;
+            for (key, r) in &by_name {
+                if key.contains('/') || key.contains('\\') {
+                    continue;
+                }
+                let token = key
+                    .strip_prefix("src:")
+                    .unwrap_or(key.as_str())
+                    .trim()
+                    .to_lowercase();
+                let token = Path::new(&token)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&token)
+                    .to_string();
+                if token.chars().count() < 2 {
+                    continue;
+                }
+                if !name_l.contains(&token) && !stem_l.contains(&token) {
+                    continue;
+                }
+                let len = token.chars().count();
+                if best.map(|(l, _)| len > l).unwrap_or(true) {
+                    best = Some((len, *r));
+                }
+            }
+            row = best.map(|(_, r)| r);
+        }
         if let Some(row) = row {
             let path_str = path.display().to_string();
             mapped.insert(path_str, row);
@@ -326,5 +358,21 @@ mod tests {
         let enriched = enrich_header_rows(&old);
         assert_eq!(enriched.get("人员清单.xlsx"), Some(&3));
         assert_eq!(enriched.get("src:人员清单"), Some(&3));
+    }
+
+    #[test]
+    fn remap_matches_copy_paste_same_keyword() {
+        let dir = std::env::temp_dir().join("ae_folder_run_remap_copy");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("人员清单 - 副本.xlsx");
+        fs::write(&f, b"PK").unwrap();
+
+        let mut old = HashMap::new();
+        old.insert("src:人员清单".into(), 4usize);
+        old.insert("人员清单".into(), 4usize);
+        let mapped = remap_header_rows(&old, &dir).unwrap();
+        assert_eq!(mapped.get(&f.display().to_string()), Some(&4));
+        assert_eq!(mapped.get("人员清单 - 副本.xlsx"), Some(&4));
     }
 }

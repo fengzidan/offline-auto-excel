@@ -320,6 +320,96 @@ export function createEmptyPipeline(name = "未命名方案"): Pipeline {
   return normalizePipeline(p);
 }
 
+/** 操作指引用固定方案 id，重复打开会重置为最简示例 */
+export const GUIDE_DEMO_SCHEME_ID = "ae-guide-demo";
+
+/** 内置最简示例：开始 → 筛选 → 输出，并带一个「月份」初始数据 */
+export function createGuideDemoPipeline(): Pipeline {
+  const startId = "guide-start";
+  const filterId = "guide-filter";
+  const outputId = "guide-output";
+  const filterOut = "tmp:guide-filter";
+  const monthKey = "月份";
+  const monthNodeId = `prompt:${monthKey}`;
+
+  const start: Step = {
+    id: startId,
+    name: "开始",
+    outputTableId: "tmp:guide-start",
+    operation: { type: "start", sourceDir: "" },
+    result: { enabled: false, fileKey: "main", sheetName: "" },
+  };
+  const filter: Step = {
+    id: filterId,
+    name: "筛选示例",
+    outputTableId: filterOut,
+    operation: {
+      type: "filter",
+      inputTableId: "",
+      conditions: [
+        {
+          column: "",
+          op: "contains",
+          value: `\${${monthKey}}`,
+          join: "and",
+        },
+      ],
+      matchMode: "and",
+    },
+    result: {
+      enabled: true,
+      fileKey: "main",
+      sheetName: "筛选结果",
+    },
+  };
+  const output: Step = {
+    id: outputId,
+    name: "输出",
+    outputTableId: "tmp:guide-output",
+    operation: {
+      type: "output",
+      outputDir: "",
+      sheets: [{ tableId: filterOut, sheetName: "筛选结果" }],
+    },
+    result: { enabled: false, fileKey: "main", sheetName: "" },
+  };
+
+  return normalizePipeline({
+    id: GUIDE_DEMO_SCHEME_ID,
+    name: "入门示例",
+    sourceDir: "",
+    outputDir: "",
+    headerRows: {},
+    steps: [start, filter, output],
+    outputSheets: [
+      { stepId: filterId, sheetName: "筛选结果" },
+    ],
+    folderMerges: {},
+    flowPositions: {
+      [startId]: { x: 280, y: 48 },
+      [filterId]: { x: 280, y: 380 },
+      [outputId]: { x: 280, y: 540 },
+      [monthNodeId]: { x: 600, y: 48 },
+    },
+    flowEdges: [
+      {
+        id: `${filterId}->${outputId}`,
+        source: filterId,
+        target: outputId,
+      },
+      {
+        id: `${monthNodeId}->${filterId}`,
+        source: monthNodeId,
+        target: filterId,
+      },
+    ],
+    sourceMatchers: [],
+    promptFields: [
+      { key: monthKey, label: monthKey, defaultValue: "", required: true },
+    ],
+  });
+}
+
 /** Keep outputSheets in sync with the output node (or legacy result flags). */
 export function syncOutputSheets(pipeline: Pipeline): OutputSheet[] {
   const outStep = pipeline.steps.find((s) => s.operation.type === "output");

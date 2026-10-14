@@ -351,6 +351,7 @@ function FieldNode({ data }: NodeProps<FlowNode>) {
   return (
     <div
       className={`rf-node field ${data.inPath ? "in-path" : ""} ${data.dimmed ? "dimmed" : ""} ${data.active ? "active" : ""}`}
+      data-guide="node-prompt-field"
     >
       <QuadHandles />
       <div className="rf-top">
@@ -379,6 +380,15 @@ function StepNode({ data }: NodeProps<FlowNode>) {
     <div
       className={`rf-node step ${isOutput ? "output" : ""} ${isStart ? "start" : ""} ${data.active ? "active" : ""} ${data.inPath ? "in-path" : ""} ${data.dimmed ? "dimmed" : ""} ${data.inputWarn ? "warn" : ""} ${data.runDone ? "run-done" : ""} ${data.runCurrent ? "run-current" : ""}`}
       style={{ ["--flow-accent" as string]: accent }}
+      data-guide={
+        isStart
+          ? "node-start"
+          : isOutput
+            ? "node-output"
+            : data.step?.operation.type === "filter"
+              ? "node-filter"
+              : undefined
+      }
     >
       <QuadHandles />
       <div className="rf-top">

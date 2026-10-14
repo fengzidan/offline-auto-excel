@@ -25,6 +25,7 @@ fn score_keyword(table: &SourceTable, keyword: &str) -> i32 {
 }
 
 /// Bind stable matcher ids to scanned tables by fuzzy keyword on name/path.
+/// Unmatched scanned files are omitted — only scheme-registered matchers appear.
 pub fn apply_source_matchers(
     scanned: &[SourceTable],
     matchers: &[SourceMatcher],
@@ -33,6 +34,7 @@ pub fn apply_source_matchers(
         .iter()
         .filter(|m| !m.keyword.trim().is_empty() && !m.id.trim().is_empty())
         .collect();
+    // No matchers registered: keep raw scan (legacy schemes without sourceMatchers).
     if list.is_empty() {
         return scanned.to_vec();
     }
@@ -106,12 +108,6 @@ pub fn apply_source_matchers(
         }
     }
 
-    let leftovers: Vec<SourceTable> = scanned
-        .iter()
-        .filter(|t| !claimed_ids.contains(&t.id) && !claimed_paths.contains(&t.path))
-        .cloned()
-        .collect();
-    bound.extend(leftovers);
     bound
 }
 
@@ -119,13 +115,13 @@ pub fn apply_source_matchers(
 mod tests {
     use super::*;
 
-    fn table(id: &str, name: &str) -> SourceTable {
+    fn table(id: &str, name: &str, path: &str) -> SourceTable {
         SourceTable {
             id: id.into(),
             name: name.into(),
-            path: format!("/data/{name}.xlsx"),
-            headers: vec!["a".into()],
-            row_count: 1,
+            path: path.into(),
+            headers: vec![],
+            row_count: 0,
             header_row: 1,
             header_ok: true,
             header_message: String::new(),
@@ -139,7 +135,11 @@ mod tests {
 
     #[test]
     fn fuzzy_binds_renamed_file() {
-        let scanned = vec![table("src:人员清单_202603", "人员清单_202603")];
+        let scanned = vec![table(
+            "src:人员清单_202603",
+            "人员清单_202603.xlsx",
+            "/data/人员清单_202603.xlsx",
+        )];
         let matchers = vec![SourceMatcher {
             id: "src:人员清单".into(),
             keyword: "人员清单".into(),
@@ -148,32 +148,48 @@ mod tests {
         let out = apply_source_matchers(&scanned, &matchers);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "src:人员清单");
-        assert_eq!(out[0].matched_name, "人员清单_202603");
-        assert!(out[0].path.contains("人员清单_202603"));
+        assert_eq!(out[0].matched_name, "人员清单_202603.xlsx");
     }
 
     #[test]
     fn longer_keyword_wins() {
         let scanned = vec![
-            table("src:赔付", "赔付"),
-            table("src:赔付支出明细", "赔付支出明细"),
+            table("a", "赔付.xlsx", "/a/赔付.xlsx"),
+            table("b", "赔付支出明细.xlsx", "/b/赔付支出明细.xlsx"),
         ];
         let matchers = vec![
             SourceMatcher {
-                id: "src:a".into(),
+                id: "src:赔付".into(),
                 keyword: "赔付".into(),
-                label: String::new(),
+                label: "赔付".into(),
             },
             SourceMatcher {
-                id: "src:b".into(),
+                id: "src:明细".into(),
                 keyword: "赔付支出明细".into(),
-                label: String::new(),
+                label: "明细".into(),
             },
         ];
         let out = apply_source_matchers(&scanned, &matchers);
-        let b = out.iter().find(|t| t.id == "src:b").unwrap();
-        assert_eq!(b.matched_name, "赔付支出明细");
-        let a = out.iter().find(|t| t.id == "src:a").unwrap();
-        assert_eq!(a.matched_name, "赔付");
+        assert_eq!(out.len(), 2);
+        let detail = out.iter().find(|t| t.id == "src:明细").unwrap();
+        assert_eq!(detail.matched_name, "赔付支出明细.xlsx");
+        let pay = out.iter().find(|t| t.id == "src:赔付").unwrap();
+        assert_eq!(pay.matched_name, "赔付.xlsx");
+    }
+
+    #[test]
+    fn no_leftovers_when_matchers_present() {
+        let scanned = vec![
+            table("a", "人员清单.xlsx", "/a/人员清单.xlsx"),
+            table("b", "临时表.xlsx", "/b/临时表.xlsx"),
+        ];
+        let matchers = vec![SourceMatcher {
+            id: "src:人员清单".into(),
+            keyword: "人员清单".into(),
+            label: "人员清单".into(),
+        }];
+        let out = apply_source_matchers(&scanned, &matchers);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "src:人员清单");
     }
 }

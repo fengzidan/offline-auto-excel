@@ -52,15 +52,16 @@ export function scoreSourceKeyword(table: SourceTable, keyword: string): number 
 
 /**
  * Apply user-defined keywords: bind stable matcher.id to the best scanned table
- * whose name/path contains the keyword. Unmatched matchers become placeholder
- * sources; remaining scanned tables stay available.
+ * whose name/path contains the keyword. Unmatched matchers become placeholders.
+ * Unmatched scanned files are NOT returned (deleted / unused files stay gone
+ * until the user explicitly refreshes the directory).
  */
 export function applySourceMatchers(
   scanned: SourceTable[],
   matchers: SourceMatcher[] | undefined,
 ): SourceTable[] {
   const list = (matchers ?? []).filter((m) => m.keyword?.trim() && m.id?.trim());
-  if (list.length === 0) return scanned;
+  if (list.length === 0) return [];
 
   // Longer keywords first, so "赔付支出明细" beats "赔付"
   const ordered = [...list].sort(
@@ -108,10 +109,7 @@ export function applySourceMatchers(
     }
   }
 
-  const leftovers = scanned.filter(
-    (t) => !claimed.has(t.id) && !claimed.has(t.path),
-  );
-  return [...bound, ...leftovers];
+  return bound;
 }
 
 /** For each scanned table not yet covered, add a matcher with auto default keyword. */
@@ -220,4 +218,34 @@ export function shouldShowSourceOnCanvas(s: SourceTable): boolean {
 
 export function canvasSourceIds(sources: SourceTable[]): string[] {
   return sources.filter(shouldShowSourceOnCanvas).map((s) => s.id);
+}
+
+/** Identity keys for a source (path / basename / stem / id) — used when purging deleted sources. */
+export function sourceIdentityKeys(
+  table: Pick<SourceTable, "id" | "path" | "name" | "matchedName">,
+): string[] {
+  const keys = new Set<string>();
+  const add = (raw?: string | null) => {
+    const v = String(raw ?? "").trim();
+    if (!v) return;
+    keys.add(v);
+  };
+  add(table.id);
+  add(table.path);
+  add(table.matchedName);
+  add(table.name);
+  const base = (table.path || table.matchedName || table.name || "")
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter(Boolean)
+    .pop();
+  if (base) {
+    add(base);
+    const stem = base.replace(/\.[^.]+$/, "");
+    if (stem) {
+      add(stem);
+      if (!stem.startsWith("src:")) add(`src:${stem}`);
+    }
+  }
+  return [...keys];
 }

@@ -180,6 +180,61 @@ fn rank_excel_files(files: Vec<PathBuf>) -> Vec<RankedFile> {
     ranked
 }
 
+/// Portable token from a headerRows key (basename / stem / src:id / keyword).
+/// Absolute paths are skipped so fuzzy matching only uses short keys.
+fn portable_header_token(key: &str) -> Option<String> {
+    let k = key.trim();
+    if k.is_empty() || k.contains('/') || k.contains('\\') {
+        return None;
+    }
+    let rest = k.strip_prefix("src:").unwrap_or(k);
+    let stem = Path::new(rest)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(rest)
+        .trim();
+    if stem.chars().count() < 2 {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
+/// Match copy-pasted / renamed files that still contain the same keyword or src id stem.
+fn header_override_by_keyword(
+    header_overrides: &HashMap<String, usize>,
+    file_path: &str,
+) -> Option<usize> {
+    let path = Path::new(file_path);
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if name.is_empty() && stem.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, usize)> = None; // (token_len, row)
+    for (key, row) in header_overrides {
+        let Some(token) = portable_header_token(key) else {
+            continue;
+        };
+        let t = token.to_lowercase();
+        if !name.contains(&t) && !stem.contains(&t) {
+            continue;
+        }
+        let len = t.chars().count();
+        if best.map(|(l, _)| len > l).unwrap_or(true) {
+            best = Some((len, *row));
+        }
+    }
+    best.map(|(_, row)| row)
+}
+
 fn header_override_for(
     header_overrides: &HashMap<String, usize>,
     file_path: &str,
@@ -208,7 +263,8 @@ fn header_override_for(
             return Some(row);
         }
     }
-    None
+    // Same keyword / matcher id: e.g. 人员清单.xlsx → 人员清单 - 副本.xlsx
+    header_override_by_keyword(header_overrides, file_path)
 }
 
 fn canonical_merge_key(s: &str) -> String {

@@ -102,14 +102,21 @@ export function stepInputIds(op: Operation): string[] {
     case "lookupSubtract":
       return [op.leftTableId, op.rightTableId].filter(Boolean);
     case "sideBySide": {
-      const fromCells = (op.cells ?? [])
-        .map((c) => c.tableId)
-        .filter(Boolean);
-      if (fromCells.length) return [...new Set(fromCells)];
-      const fromBlocks = (op.blocks ?? [])
-        .map((b) => b.tableId)
-        .filter(Boolean);
-      if (fromBlocks.length) return [...new Set(fromBlocks)];
+      // cells 已配置时只认格子里的表，避免历史 tableIds 把未使用源表当成仍在用
+      if ((op.cells ?? []).length > 0) {
+        return [
+          ...new Set(
+            (op.cells ?? []).map((c) => c.tableId).filter(Boolean),
+          ),
+        ];
+      }
+      if ((op.blocks ?? []).length > 0) {
+        return [
+          ...new Set(
+            (op.blocks ?? []).map((b) => b.tableId).filter(Boolean),
+          ),
+        ];
+      }
       if (op.columns?.length) {
         return [...new Set(op.columns.map((c) => c.tableId).filter(Boolean))];
       }

@@ -16,9 +16,17 @@ function basenameParts(pathOrName: string): string[] {
   return out;
 }
 
+function portableToken(key: string): string {
+  return key
+    .replace(/^src:/, "")
+    .replace(/\.[^.]+$/, "")
+    .trim()
+    .toLowerCase();
+}
+
 /**
- * Source ids that have subsequent process steps (used as a step input).
- * Canvas-only / start→source with no downstream consumer are omitted on export.
+ * 导出时保留的源表：仅被后续加工/输出步骤实际引用的源表。
+ * 只挂在开始节点、未进入任何步骤的表不导出。
  */
 export function flowchartSourceIds(
   pipeline: Pipeline,
@@ -26,7 +34,9 @@ export function flowchartSourceIds(
 ): Set<string> {
   const steps = pipeline.steps ?? [];
   const stepIds = new Set(steps.map((s) => s.id));
-  const stepOutputs = new Set(steps.map((s) => s.outputTableId).filter(Boolean));
+  const stepOutputs = new Set(
+    steps.map((s) => s.outputTableId).filter(Boolean),
+  );
   const promptIds = new Set(
     (pipeline.promptFields ?? [])
       .map((f) => promptFieldNodeId(f.key.trim() || f.label?.trim() || ""))
@@ -37,21 +47,53 @@ export function flowchartSourceIds(
   );
   const kept = new Set<string>();
 
+  const consider = (raw: string) => {
+    const id = raw.trim();
+    if (!id) return;
+    if (stepIds.has(id) || stepOutputs.has(id) || promptIds.has(id)) return;
+    if (matcherIds.has(id) || id.startsWith("src:")) kept.add(id);
+  };
+
   for (const step of steps) {
     if (step.operation.type === "start") continue;
     for (const tid of stepInputIds(step.operation)) {
-      const id = tid.trim();
-      if (!id) continue;
-      if (stepIds.has(id) || stepOutputs.has(id) || promptIds.has(id)) continue;
-      // 步骤引用的源表 id（通常 src:… 或 matcher id）
-      if (matcherIds.has(id) || id.startsWith("src:")) kept.add(id);
+      consider(tid);
     }
+  }
+
+  // 连线上：源表 → 加工步骤（开始→源表不算「用到」）
+  const startId = steps.find((s) => s.operation.type === "start")?.id;
+  for (const e of pipeline.flowEdges ?? []) {
+    const src = e.source?.trim();
+    const tgt = e.target?.trim();
+    if (!src || !tgt) continue;
+    if (startId && src === startId) continue;
+    if (!stepIds.has(tgt) || tgt === startId) continue;
+    if (stepIds.has(src) || promptIds.has(src)) continue;
+    consider(src);
   }
 
   return kept;
 }
 
-function mergeHeaderRowsForKeptSources(
+/** Write portable header-row keys for one source / matcher. */
+function putHeaderRow(
+  into: Record<string, number>,
+  row: number,
+  keys: Array<string | undefined | null>,
+) {
+  if (!(row > 0)) return;
+  for (const raw of keys) {
+    const k = String(raw ?? "").trim();
+    if (!k) continue;
+    into[k] = row;
+    if (k.includes("/") || k.includes("\\")) {
+      for (const part of basenameParts(k)) into[part] = row;
+    }
+  }
+}
+
+function headerRowsFromSources(
   sources: SourceTable[],
   keptIds: Set<string>,
 ): Record<string, number> {
@@ -59,78 +101,136 @@ function mergeHeaderRowsForKeptSources(
   for (const t of sources) {
     if (!keptIds.has(t.id)) continue;
     if (!t.headerOk || !(t.headerRow > 0)) continue;
-    const row = t.headerRow;
-    if (t.path?.trim()) next[t.path] = row;
-    if (t.id?.trim()) next[t.id] = row;
-    const kw = t.matchKeyword?.trim();
-    if (kw) next[kw] = row;
-    for (const key of basenameParts(t.path || t.matchedName || t.name || "")) {
-      next[key] = row;
-    }
-  }
-  return next;
-}
-
-function pruneHeaderRowsByMatchers(
-  headerRows: Record<string, number> | undefined,
-  keptMatchers: SourceMatcher[],
-  keptIds: Set<string>,
-): Record<string, number> {
-  const allowed = new Set<string>();
-  for (const id of keptIds) {
-    allowed.add(id);
-    for (const key of basenameParts(id)) allowed.add(key);
-  }
-  for (const m of keptMatchers) {
-    allowed.add(m.id);
-    for (const key of basenameParts(m.id)) allowed.add(key);
-    if (m.keyword?.trim()) {
-      allowed.add(m.keyword.trim());
-      for (const key of basenameParts(m.keyword.trim())) allowed.add(key);
-    }
-    if (m.label?.trim()) {
-      allowed.add(m.label.trim());
-      for (const key of basenameParts(m.label.trim())) allowed.add(key);
-    }
-  }
-  const portableTokens = [...allowed]
-    .filter((k) => !k.includes("/") && !k.includes("\\"))
-    .map((k) =>
-      k
-        .replace(/^src:/, "")
-        .replace(/\.[^.]+$/, "")
-        .trim()
-        .toLowerCase(),
-    )
-    .filter((t) => t.length >= 2);
-
-  const next: Record<string, number> = {};
-  for (const [key, row] of Object.entries(headerRows ?? {})) {
-    if (!(row > 0)) continue;
-    if (allowed.has(key)) {
-      next[key] = row;
-      continue;
-    }
-    // Keep basename / copy-paste keys that still match a kept keyword
-    if (key.includes("/") || key.includes("\\")) continue;
-    const token = key
-      .replace(/^src:/, "")
-      .replace(/\.[^.]+$/, "")
-      .trim()
-      .toLowerCase();
-    if (
-      token.length >= 2 &&
-      portableTokens.some((t) => token.includes(t) || t.includes(token))
-    ) {
-      next[key] = row;
-    }
+    putHeaderRow(next, t.headerRow, [
+      t.path,
+      t.id,
+      t.matchKeyword,
+      t.matchedName,
+      t.name,
+      ...basenameParts(t.path || t.matchedName || t.name || ""),
+    ]);
   }
   return next;
 }
 
 /**
- * 导出前裁剪：去掉无后续流程的源表配置与孤立坐标/连线。
- * 保留步骤、初始数据，以及仍被后续步骤引用的源表。
+ * 只保留已用源表相关的表头行；用精确 token 匹配，避免把未使用表的键模糊带进来。
+ */
+function headerRowsFromPipeline(
+  headerRows: Record<string, number> | undefined,
+  keptMatchers: SourceMatcher[],
+  keptIds: Set<string>,
+): Record<string, number> {
+  const allowedExact = new Set<string>();
+  const allowedTokens = new Set<string>();
+
+  const addAllowed = (raw?: string) => {
+    const k = String(raw ?? "").trim();
+    if (!k) return;
+    allowedExact.add(k);
+    for (const part of basenameParts(k)) {
+      allowedExact.add(part);
+      const t = portableToken(part);
+      if (t.length >= 2) allowedTokens.add(t);
+    }
+    const t = portableToken(k);
+    if (t.length >= 2) allowedTokens.add(t);
+  };
+
+  for (const id of keptIds) addAllowed(id);
+  for (const m of keptMatchers) {
+    addAllowed(m.id);
+    addAllowed(m.keyword);
+    addAllowed(m.label);
+  }
+
+  const matchesAllowed = (key: string): boolean => {
+    if (allowedExact.has(key)) return true;
+    for (const part of basenameParts(key)) {
+      if (allowedExact.has(part)) return true;
+    }
+    const token = portableToken(key);
+    return token.length >= 2 && allowedTokens.has(token);
+  };
+
+  const next: Record<string, number> = {};
+  for (const [key, row] of Object.entries(headerRows ?? {})) {
+    if (!(row > 0)) continue;
+    if (!matchesAllowed(key)) continue;
+    if (key.includes("/") || key.includes("\\")) {
+      putHeaderRow(next, row, [key]);
+      continue;
+    }
+    next[key] = row;
+  }
+
+  for (const m of keptMatchers) {
+    const id = m.id.trim();
+    if (!id) continue;
+    const candidates = [
+      id,
+      m.keyword?.trim(),
+      m.label?.trim(),
+      ...basenameParts(id),
+      ...basenameParts(m.keyword ?? ""),
+    ].filter(Boolean) as string[];
+    let found = 0;
+    for (const c of candidates) {
+      if (next[c] > 0) {
+        found = next[c];
+        break;
+      }
+      const fromOrig = headerRows?.[c];
+      if (fromOrig && fromOrig > 0) {
+        found = fromOrig;
+        break;
+      }
+    }
+    if (!(found > 0)) {
+      const idToken = portableToken(id);
+      const kwToken = portableToken(m.keyword ?? "");
+      for (const [key, row] of Object.entries({ ...headerRows, ...next })) {
+        if (!(row > 0)) continue;
+        const token = portableToken(key);
+        if (!token) continue;
+        if (idToken && token === idToken) {
+          found = row;
+          break;
+        }
+        if (kwToken && token === kwToken) {
+          found = row;
+          break;
+        }
+      }
+    }
+    if (found > 0) {
+      putHeaderRow(next, found, [id, m.keyword, m.label]);
+    }
+  }
+
+  return next;
+}
+
+export function buildExportHeaderRows(
+  pipeline: Pipeline,
+  sources: SourceTable[] | null | undefined,
+  keptIds: Set<string>,
+  keptMatchers: SourceMatcher[],
+): Record<string, number> {
+  const fromPipeline = headerRowsFromPipeline(
+    pipeline.headerRows,
+    keptMatchers,
+    keptIds,
+  );
+  const fromSources = headerRowsFromSources(
+    (sources ?? []).filter((s) => keptIds.has(s.id)),
+    keptIds,
+  );
+  return { ...fromPipeline, ...fromSources };
+}
+
+/**
+ * 导出前裁剪：去掉未进入后续流程的源表及其表头/坐标/连线。
  */
 export function prunePipelineForExport(
   pipeline: Pipeline,
@@ -146,14 +246,12 @@ export function prunePipelineForExport(
     if (keptIds.has(id)) folderMerges[id] = merge;
   }
 
-  const canvasSources = (sources ?? []).filter((s) => keptIds.has(s.id));
-  const headerRows = canvasSources.length
-    ? mergeHeaderRowsForKeptSources(canvasSources, keptIds)
-    : pruneHeaderRowsByMatchers(
-        pipeline.headerRows,
-        sourceMatchers,
-        keptIds,
-      );
+  const headerRows = buildExportHeaderRows(
+    pipeline,
+    sources,
+    keptIds,
+    sourceMatchers,
+  );
 
   const stepIds = new Set(pipeline.steps.map((s) => s.id));
   const promptIds = new Set(

@@ -105,7 +105,7 @@ import {
   syncPromptFieldsFromSteps,
   validateRuntimeParams,
 } from "./runtimeParams";
-import { prunePipelineForExport } from "./pipelineExport";
+import { flowchartSourceIds, prunePipelineForExport } from "./pipelineExport";
 import "./App.css";
 
 const STEP_PALETTE: {
@@ -2147,15 +2147,29 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      const raw =
+      const loaded =
         pipeline?.id === id
           ? pipeline
           : normalizePipelineWithMeta(await loadScheme(id)).pipeline;
-      // 仅当前打开方案有实时源表列表，可按画布可见源表裁剪；
-      // 未打开的方案只按步骤引用与开始连线保留源表配置。
+      // 仅当前打开方案有实时源表列表；未打开的方案只按步骤引用保留。
       const sourcesForExport =
         pipeline?.id === id ? sourcesRef.current : null;
-      const pruned = prunePipelineForExport(raw, sourcesForExport);
+      const keptForExport = flowchartSourceIds(loaded, sourcesForExport);
+      // 只把「实际用到的」源表表头写进导出，避免未使用表混入
+      const usedSources = (sourcesForExport ?? []).filter((s) =>
+        keptForExport.has(s.id),
+      );
+      const raw: Pipeline =
+        usedSources.length > 0
+          ? {
+              ...loaded,
+              headerRows: mergeHeaderRowsFromSources(
+                loaded.headerRows,
+                usedSources,
+              ),
+            }
+          : loaded;
+      const pruned = prunePipelineForExport(raw, usedSources);
       const out = await exportPipelineFile(pruned, path);
       setStatus(`方案已导出：${out}`);
     } catch (e) {

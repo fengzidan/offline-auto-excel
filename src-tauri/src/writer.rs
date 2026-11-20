@@ -210,7 +210,64 @@ fn write_table(worksheet: &mut Worksheet, table: &DataTable) -> Result<(), Strin
             .set_freeze_panes(1, 0)
             .map_err(|e| e.to_string())?;
     }
-    worksheet.autofit();
+    apply_header_column_widths(worksheet, table)?;
+    Ok(())
+}
+
+/// 表头显示宽度：ASCII≈1，中日韩等全角≈2（贴近 Excel 默认字体列宽单位）。
+fn header_display_units(s: &str) -> f64 {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii() {
+                1.0
+            } else {
+                2.0
+            }
+        })
+        .sum()
+}
+
+/// 按表头（及版面中的表头带）自适应列宽，最低约 8 个字符宽。
+fn apply_header_column_widths(
+    worksheet: &mut Worksheet,
+    table: &DataTable,
+) -> Result<(), String> {
+    const MIN_WIDTH: f64 = 8.0;
+    const PAD: f64 = 1.5; // 表头加粗略留白
+    const MAX_WIDTH: f64 = 60.0;
+
+    let mut col_count = table.headers.len();
+    for row in &table.rows {
+        col_count = col_count.max(row.len());
+    }
+    for band in &table.header_bands {
+        col_count = col_count.max(band.col + band.groups.len());
+    }
+    if col_count == 0 {
+        return Ok(());
+    }
+
+    let mut widths = vec![0.0_f64; col_count];
+    for (c, h) in table.headers.iter().enumerate() {
+        widths[c] = widths[c].max(header_display_units(h));
+    }
+    for band in &table.header_bands {
+        for i in 0..band.groups.len() {
+            let col = band.col + i;
+            if col >= widths.len() {
+                continue;
+            }
+            let val = cell_at(table, band.row, col);
+            widths[col] = widths[col].max(header_display_units(&val));
+        }
+    }
+
+    for (c, units) in widths.iter().enumerate() {
+        let width = (units + PAD).max(MIN_WIDTH).min(MAX_WIDTH);
+        worksheet
+            .set_column_width(c as u16, width)
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 

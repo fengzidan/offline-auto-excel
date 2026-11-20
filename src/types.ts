@@ -120,6 +120,16 @@ export type Operation =
       aggregation?: string;
     }
   | {
+      /** 行转列：行字段保留，列字段唯一值展开为表头，值字段填入交叉格 */
+      type: "rowToCol";
+      inputTableId: string;
+      rowFields: string[];
+      columnField: string;
+      valueField: string;
+      /** sum | count | avg */
+      aggregation?: string;
+    }
+  | {
       type: "calculate";
       baseTableId: string;
       /** @deprecated prefer columns; kept for legacy schemes */
@@ -907,6 +917,19 @@ export function createStep(
           inputTableId,
           rowFields: [],
           valueFields: [],
+        },
+      };
+    case "rowToCol":
+      return {
+        ...base,
+        name: "行转列",
+        operation: {
+          type: "rowToCol",
+          inputTableId,
+          rowFields: [],
+          columnField: "",
+          valueField: "",
+          aggregation: "sum",
         },
       };
     case "calculate":

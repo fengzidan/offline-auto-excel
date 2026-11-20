@@ -680,6 +680,7 @@ pub fn export_formula_template(pipeline: Pipeline, output_path: String) -> Resul
                 );
             }
             Operation::Dedupe { .. } => {}
+            Operation::RowToCol { .. } => {}
             Operation::SideBySide { .. } => {}
             Operation::Vlookup { .. } => {}
             Operation::FullJoin { .. } => {}

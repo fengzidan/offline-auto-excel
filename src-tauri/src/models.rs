@@ -219,6 +219,21 @@ pub enum Operation {
         #[serde(default = "default_sum")]
         aggregation: String,
     },
+    /// 行转列：保留行字段，把某一列的唯一值展开为表头，交叉格填值字段（可聚合）。
+    #[serde(rename_all = "camelCase")]
+    RowToCol {
+        input_table_id: String,
+        /// 仍作为行的列（可多列）
+        #[serde(default)]
+        row_fields: Vec<String>,
+        /// 唯一值变成表头的那一列
+        column_field: String,
+        /// 填入交叉格的值列
+        value_field: String,
+        /// sum | count | avg
+        #[serde(default = "default_sum")]
+        aggregation: String,
+    },
     #[serde(rename_all = "camelCase")]
     Calculate {
         base_table_id: String,

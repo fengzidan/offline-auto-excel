@@ -7,12 +7,31 @@ pub fn parse_number(s: &str) -> f64 {
     cleaned.parse::<f64>().unwrap_or(0.0)
 }
 
-/// 仅用于加减乘除（及乘方）时的中间/结果四舍五入到 2 位小数。
+/// 加减乘除的**操作数**先收到 2 位小数（金额习惯）；结果不再用它，以免 `(达成/目标)*100` 丢掉百分位。
 fn round_calc(n: f64) -> f64 {
     if !n.is_finite() {
         return 0.0;
     }
     (n * 100.0).round() / 100.0
+}
+
+/// 清理浮点噪点，保留足够精度供后续 ROUND(...,1) 等使用。
+fn scrub_float(n: f64) -> f64 {
+    if !n.is_finite() {
+        return 0.0;
+    }
+    (n * 1e12).round() / 1e12
+}
+
+fn format_fixed_decimals(n: f64, digits: i32) -> String {
+    if !n.is_finite() {
+        return String::new();
+    }
+    if digits <= 0 {
+        format!("{:.0}", n)
+    } else {
+        format!("{:.*}", digits as usize, n)
+    }
 }
 
 fn format_number(v: f64) -> String {
@@ -118,6 +137,107 @@ pub fn apply_pivot(
     }
 
     Ok(DataTable { headers, rows, ..Default::default() })
+}
+
+fn row_to_col_label(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        "(空白)".into()
+    } else {
+        t.to_string()
+    }
+}
+
+fn row_to_col_agg(sum: f64, count: usize, aggregation: &str) -> f64 {
+    match aggregation {
+        "count" => count as f64,
+        "avg" => {
+            if count == 0 {
+                0.0
+            } else {
+                sum / count as f64
+            }
+        }
+        _ => sum,
+    }
+}
+
+/// 行转列：`row_fields` 保留为行；`column_field` 唯一值展开为表头；交叉格为 `value_field` 聚合结果。
+pub fn apply_row_to_col(
+    table: &DataTable,
+    row_fields: &[String],
+    column_field: &str,
+    value_field: &str,
+    aggregation: &str,
+) -> Result<DataTable, String> {
+    if row_fields.is_empty() {
+        return Err("行转列至少需要一个行字段".into());
+    }
+    let col_field = column_field.trim();
+    if col_field.is_empty() {
+        return Err("请选择要展开成表头的列字段".into());
+    }
+    let val_field = value_field.trim();
+    if val_field.is_empty() {
+        return Err("请选择交叉格的值字段".into());
+    }
+    if row_fields.iter().any(|f| f.trim() == col_field) {
+        return Err("列字段不能与行字段相同".into());
+    }
+
+    let row_idxs: Vec<usize> = row_fields
+        .iter()
+        .map(|f| table.col_index(f))
+        .collect::<Result<_, _>>()?;
+    let col_idx = table.col_index(col_field)?;
+    let val_idx = table.col_index(val_field)?;
+
+    let mut map: HashMap<(Vec<String>, String), (f64, usize)> = HashMap::new();
+    let mut col_set: HashMap<String, ()> = HashMap::new();
+
+    for row in &table.rows {
+        let row_key: Vec<String> = row_idxs
+            .iter()
+            .map(|i| row.get(*i).cloned().unwrap_or_default())
+            .collect();
+        let col_raw = row.get(col_idx).cloned().unwrap_or_default();
+        let col_key = row_to_col_label(&col_raw);
+        col_set.insert(col_key.clone(), ());
+        let num = parse_number(row.get(val_idx).map(|s| s.as_str()).unwrap_or(""));
+        let entry = map.entry((row_key, col_key)).or_insert((0.0, 0));
+        entry.0 += num;
+        entry.1 += 1;
+    }
+
+    let mut col_keys: Vec<String> = col_set.into_keys().collect();
+    col_keys.sort();
+
+    let mut headers = row_fields.to_vec();
+    headers.extend(col_keys.iter().cloned());
+
+    let mut row_keys: Vec<Vec<String>> = map.keys().map(|(r, _)| r.clone()).collect();
+    row_keys.sort();
+    row_keys.dedup();
+
+    let mut rows = Vec::new();
+    for rk in row_keys {
+        let mut out = rk.clone();
+        for ck in &col_keys {
+            match map.get(&(rk.clone(), ck.clone())).copied() {
+                Some((sum, count)) if count > 0 => {
+                    out.push(format_number(row_to_col_agg(sum, count, aggregation)));
+                }
+                _ => out.push(String::new()),
+            }
+        }
+        rows.push(out);
+    }
+
+    Ok(DataTable {
+        headers,
+        rows,
+        ..Default::default()
+    })
 }
 
 pub fn apply_lookup_subtract(
@@ -383,6 +503,13 @@ pub fn apply_calculate(
                     env.texts.insert(field.to_string(), s.clone());
                     env.texts.insert(format!("{base_table_id}!{field}"), s);
                 }
+                CalcValue::Rounded(n, digits) => {
+                    env.nums.insert(field.to_string(), *n);
+                    env.nums.insert(format!("{base_table_id}!{field}"), *n);
+                    let s = format_fixed_decimals(*n, *digits);
+                    env.texts.insert(field.to_string(), s.clone());
+                    env.texts.insert(format!("{base_table_id}!{field}"), s);
+                }
                 CalcValue::Str(s) => {
                     env.texts.insert(field.to_string(), s.clone());
                     env.texts
@@ -480,6 +607,8 @@ struct FormulaEnv<'a> {
 #[derive(Debug, Clone, PartialEq)]
 enum CalcValue {
     Num(f64),
+    /// `ROUND(x, digits)` 的结果：参与运算仍是数值，写入/拼接时按 `digits` 位小数格式化。
+    Rounded(f64, i32),
     Str(String),
     Bool(bool),
 }
@@ -488,6 +617,7 @@ impl CalcValue {
     fn to_cell(&self) -> String {
         match self {
             CalcValue::Num(n) => format_number(*n),
+            CalcValue::Rounded(n, digits) => format_fixed_decimals(*n, *digits),
             CalcValue::Str(s) => s.clone(),
             CalcValue::Bool(b) => {
                 if *b {
@@ -501,7 +631,7 @@ impl CalcValue {
 
     fn as_number(&self) -> Result<f64, String> {
         match self {
-            CalcValue::Num(n) => Ok(*n),
+            CalcValue::Num(n) | CalcValue::Rounded(n, _) => Ok(*n),
             CalcValue::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
             CalcValue::Str(s) => {
                 let t = s.trim();
@@ -519,7 +649,7 @@ impl CalcValue {
     fn is_truthy(&self) -> bool {
         match self {
             CalcValue::Bool(b) => *b,
-            CalcValue::Num(n) => *n != 0.0,
+            CalcValue::Num(n) | CalcValue::Rounded(n, _) => *n != 0.0,
             CalcValue::Str(s) => !s.is_empty(),
         }
     }
@@ -528,6 +658,7 @@ impl CalcValue {
         match self {
             CalcValue::Str(s) => s.clone(),
             CalcValue::Num(n) => format_number(*n),
+            CalcValue::Rounded(n, digits) => format_fixed_decimals(*n, *digits),
             CalcValue::Bool(b) => {
                 if *b {
                     "TRUE".into()
@@ -542,10 +673,11 @@ impl CalcValue {
         self.as_criteria_text()
     }
 
-    /// `&` / CONCAT：数值按两位小数拼进文本（四舍五入）。
+    /// `&` / CONCAT：普通数值默认两位小数；`ROUND` 结果按指定位数。
     fn as_concat_text(&self) -> String {
         match self {
             CalcValue::Num(n) => format!("{:.2}", round_calc(*n)),
+            CalcValue::Rounded(n, digits) => format_fixed_decimals(*n, *digits),
             other => other.as_text(),
         }
     }
@@ -768,9 +900,10 @@ fn parse_expr(
         }
         *pos += 1;
         let right = parse_term(tokens, pos, env)?;
-        let a = round_calc(left.as_number()?);
-        let b = round_calc(right.as_number()?);
-        left = CalcValue::Num(round_calc(if *op == '+' { a + b } else { a - b }));
+        // 加减也不再对操作数收 2 位：否则 1/3-1 → 0.33-1 → 后续得分变成 -34 而非 -33.3
+        let a = left.as_number()?;
+        let b = right.as_number()?;
+        left = CalcValue::Num(scrub_float(if *op == '+' { a + b } else { a - b }));
     }
     Ok(left)
 }
@@ -787,9 +920,10 @@ fn parse_term(
         }
         *pos += 1;
         let right = parse_power(tokens, pos, env)?;
-        let a = round_calc(left.as_number()?);
-        let b = round_calc(right.as_number()?);
-        left = CalcValue::Num(round_calc(if *op == '*' {
+        // 乘除不再对操作数收 2 位：否则 (达成/目标) 的商 0.852 再 *100 会先变成 0.85
+        let a = left.as_number()?;
+        let b = right.as_number()?;
+        left = CalcValue::Num(scrub_float(if *op == '*' {
             a * b
         } else if b == 0.0 {
             0.0
@@ -809,8 +943,8 @@ fn parse_power(
     if let Some(Tok::Op('^')) = tokens.get(*pos) {
         *pos += 1;
         let right = parse_power(tokens, pos, env)?;
-        Ok(CalcValue::Num(round_calc(
-            round_calc(left.as_number()?).powf(round_calc(right.as_number()?)),
+        Ok(CalcValue::Num(scrub_float(
+            left.as_number()?.powf(right.as_number()?),
         )))
     } else {
         Ok(left)
@@ -1385,7 +1519,9 @@ fn eval_excel_fn(name: &str, args: &[CalcValue]) -> Result<CalcValue, String> {
                 .unwrap_or(0.0)
                 .trunc() as i32;
             let factor = 10f64.powi(digits);
-            Ok(CalcValue::Num((n * factor).round() / factor))
+            let rounded = (n * factor).round() / factor;
+            // 保留位数，供 `&"%"` / 写入单元格时格式化为固定小数位（如 85.0%）
+            Ok(CalcValue::Rounded(rounded, digits))
         }
         "MOD" => {
             expect_args("MOD", args, 2)?;
@@ -1588,7 +1724,10 @@ fn eval_excel_fn(name: &str, args: &[CalcValue]) -> Result<CalcValue, String> {
         }
         "ISNUMBER" => {
             expect_args("ISNUMBER", args, 1)?;
-            Ok(CalcValue::Bool(matches!(args[0], CalcValue::Num(_))))
+            Ok(CalcValue::Bool(matches!(
+                args[0],
+                CalcValue::Num(_) | CalcValue::Rounded(_, _)
+            )))
         }
         "ISTEXT" => {
             expect_args("ISTEXT", args, 1)?;
@@ -2353,9 +2492,19 @@ fn compare_cell(a: &str, b: &str) -> std::cmp::Ordering {
 }
 
 fn parse_number_opt(s: &str) -> Option<f64> {
-    let cleaned = s.replace(',', "").replace('，', "").trim().to_string();
+    let mut cleaned = s.replace(',', "").replace('，', "");
+    cleaned = cleaned.trim().to_string();
     if cleaned.is_empty() {
         return None;
+    }
+    // 比率/百分比展示值（如 85.2%）按数值排序，去掉末尾 %／％
+    let is_pct = cleaned.ends_with('%') || cleaned.ends_with('％');
+    if is_pct {
+        cleaned.pop();
+        cleaned = cleaned.trim_end().to_string();
+        if cleaned.is_empty() {
+            return None;
+        }
     }
     cleaned.parse::<f64>().ok()
 }
@@ -2451,14 +2600,61 @@ mod calc_tests {
     #[test]
     fn formula_math_fns() {
         assert_eq!(eval_empty("ABS(-3.5)"), CalcValue::Num(3.5));
-        assert_eq!(eval_empty("ROUND(1.234,2)"), CalcValue::Num(1.23));
-        // 加减乘除：操作数先收成 2 位再算
-        assert_eq!(eval_empty("1.006+1.004"), CalcValue::Num(2.01)); // 1.01+1.00
-        assert_eq!(eval_empty("10.006*2"), CalcValue::Num(20.02)); // 10.01*2
+        assert_eq!(eval_empty("ROUND(1.234,2)"), CalcValue::Rounded(1.23, 2));
+        // 四则运算保留全精度，需要两位时用 ROUND
+        assert_eq!(eval_empty("1.006+1.004"), CalcValue::Num(2.01));
+        assert_eq!(eval_empty("10.006*2"), CalcValue::Num(20.012));
         assert_eq!(eval_empty("POWER(2,3)"), CalcValue::Num(8.0));
         assert_eq!(eval_empty("2^3"), CalcValue::Num(8.0));
         assert_eq!(eval_empty("IF(1,10,20)"), CalcValue::Num(10.0));
         assert_eq!(eval_empty("IF(0,10,20)"), CalcValue::Num(20.0));
+    }
+
+    #[test]
+    fn formula_score_keeps_rate_precision() {
+        // 100+([达成]/[目标]-1)*100*2，达成=1 目标=3 → -33.3…；旧逻辑加减收 2 位会得到 -34
+        let mut nums = HashMap::new();
+        nums.insert("A达成".into(), 1.0);
+        nums.insert("分类_A目标".into(), 3.0);
+        assert_eq!(
+            eval_nums(
+                r#"ROUND(MIN(100+([A达成]/[分类_A目标]-1)*100*2,120),1)"#,
+                nums.clone(),
+            ),
+            CalcValue::Rounded(-33.3, 1)
+        );
+        assert_eq!(
+            eval_nums(
+                r#"ROUND(MIN(100+([A达成]/[分类_A目标]-1)*100*2,120),1)&"分""#,
+                nums,
+            ),
+            CalcValue::Str("-33.3分".into())
+        );
+    }
+
+    #[test]
+    fn formula_percent_round_keeps_one_decimal() {
+        let mut nums = HashMap::new();
+        // 852/1000 = 0.852 → *100 = 85.2；旧逻辑中间收成 0.85 会变成 85%
+        nums.insert("3级及以上达成".into(), 852.0);
+        nums.insert("3级及以上目标".into(), 1000.0);
+        assert_eq!(
+            eval_nums(
+                r#"ROUND(([3级及以上达成]/[3级及以上目标])*100,1)&"%""#,
+                nums,
+            ),
+            CalcValue::Str("85.2%".into())
+        );
+        let mut nums2 = HashMap::new();
+        nums2.insert("3级及以上达成".into(), 850.0);
+        nums2.insert("3级及以上目标".into(), 1000.0);
+        assert_eq!(
+            eval_nums(
+                r#"ROUND(([3级及以上达成]/[3级及以上目标])*100,1)&"%""#,
+                nums2,
+            ),
+            CalcValue::Str("85.0%".into())
+        );
     }
 
     fn eval_texts(expr: &str, texts: HashMap<String, String>) -> CalcValue {
@@ -2861,6 +3057,42 @@ mod calc_tests {
     }
 
     #[test]
+    fn sort_percent_as_number() {
+        let table = DataTable {
+            headers: vec!["名".into(), "达成率".into()],
+            rows: vec![
+                vec!["a".into(), "9.5%".into()],
+                vec!["b".into(), "85.2%".into()],
+                vec!["c".into(), "12.0%".into()],
+                vec!["d".into(), "100%".into()],
+            ],
+            ..Default::default()
+        };
+        let asc = apply_sort(
+            &table,
+            &[crate::models::SortKey {
+                column: "达成率".into(),
+                direction: "asc".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            asc.rows.iter().map(|r| r[1].as_str()).collect::<Vec<_>>(),
+            vec!["9.5%", "12.0%", "85.2%", "100%"]
+        );
+        let desc = apply_sort(
+            &table,
+            &[crate::models::SortKey {
+                column: "达成率".into(),
+                direction: "desc".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(desc.rows[0][1], "100%");
+        assert_eq!(desc.rows[3][1], "9.5%");
+    }
+
+    #[test]
     fn dedupe_keeps_first_by_columns() {
         let table = DataTable {
             headers: vec!["代码".into(), "姓名".into(), "保费".into()],
@@ -2929,5 +3161,30 @@ mod calc_tests {
         assert_eq!(v.rows[3][0], "x");
         assert_eq!(v.rows[4][0], "y");
         assert_eq!(v.header_bands.len(), 2);
+    }
+
+    #[test]
+    fn row_to_col_builds_matrix() {
+        let table = DataTable {
+            headers: vec!["B".into(), "A".into(), "计数".into()],
+            rows: vec![
+                vec!["张三".into(), "机构1".into(), "2".into()],
+                vec!["张三".into(), "机构2".into(), "1".into()],
+                vec!["李四".into(), "机构1".into(), "3".into()],
+            ],
+            ..Default::default()
+        };
+        let out = apply_row_to_col(
+            &table,
+            &["B".into()],
+            "A",
+            "计数",
+            "sum",
+        )
+        .unwrap();
+        assert_eq!(out.headers, vec!["B", "机构1", "机构2"]);
+        assert_eq!(out.rows.len(), 2);
+        assert_eq!(out.rows[0], vec!["张三", "2", "1"]);
+        assert_eq!(out.rows[1], vec!["李四", "3", ""]);
     }
 }

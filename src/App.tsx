@@ -115,6 +115,11 @@ const STEP_PALETTE: {
 }[] = [
   { type: "filter", label: "筛选", tip: "留下符合条件的数据，如某机构、某月份" },
   { type: "pivot", label: "透视", tip: "按机构/人员等汇总金额或笔数" },
+  {
+    type: "rowToCol",
+    label: "行转列",
+    tip: "把一列的唯一值展开成表头，做成矩阵宽表",
+  },
   { type: "calculate", label: "计算", tip: "新增业务列，如差额、是否超编" },
   { type: "sort", label: "排序", tip: "按保费、姓名等排先后" },
   {
@@ -6919,6 +6924,100 @@ function StepEditor({
               </p>
             )}
           </div>
+        </>
+      )}
+
+      {op.type === "rowToCol" && (
+        <>
+          <p className="hint step-hint-tight">
+            把长表摊成宽表：保留「行字段」，把「列字段」里的唯一值变成表头，交叉格填「值字段」。
+            常见用法：先透视得到 A/B/计数，再行转列（行=B，列=A，值=计数）。
+          </p>
+          <div className="step-inline-fields">
+            <label className="step-inline-field">
+              <span>数据表</span>
+              <select
+                value={op.inputTableId}
+                onChange={(e) =>
+                  onChange({
+                    ...step,
+                    operation: { ...op, inputTableId: e.target.value },
+                  })
+                }
+              >
+                <option value="">请选择</option>
+                {tableOptions.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="step-inline-field">
+              <span>列字段（展开成表头）</span>
+              <select
+                value={op.columnField}
+                onChange={(e) =>
+                  onChange({
+                    ...step,
+                    operation: { ...op, columnField: e.target.value },
+                  })
+                }
+              >
+                <option value="">请选择</option>
+                {headersFor(op.inputTableId).map((h) => (
+                  <option key={h} value={h}>
+                    {h}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="step-inline-field">
+              <span>值字段（填入交叉格）</span>
+              <select
+                value={op.valueField}
+                onChange={(e) =>
+                  onChange({
+                    ...step,
+                    operation: { ...op, valueField: e.target.value },
+                  })
+                }
+              >
+                <option value="">请选择</option>
+                {headersFor(op.inputTableId).map((h) => (
+                  <option key={h} value={h}>
+                    {h}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="step-inline-field">
+              <span>同格多行时</span>
+              <select
+                value={op.aggregation || "sum"}
+                onChange={(e) =>
+                  onChange({
+                    ...step,
+                    operation: { ...op, aggregation: e.target.value },
+                  })
+                }
+              >
+                <option value="sum">求和</option>
+                <option value="count">计数</option>
+                <option value="avg">平均</option>
+              </select>
+            </label>
+          </div>
+          <ColumnPickList
+            label="行字段（保留在左侧的列）"
+            headers={headersFor(op.inputTableId)}
+            selected={op.rowFields}
+            emptyHint={emptyHeadersHint(op.inputTableId)}
+            showSelectedCount={false}
+            onChange={(rowFields) =>
+              onChange({ ...step, operation: { ...op, rowFields } })
+            }
+          />
         </>
       )}
 

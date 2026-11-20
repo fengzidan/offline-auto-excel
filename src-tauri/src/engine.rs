@@ -2,9 +2,9 @@ use crate::excel_io::{apply_filter, read_excel_first_sheet, read_folder_merged};
 use crate::models::{DataTable, FolderMerge, Operation, Pipeline, PreviewData, SourceTable};
 use crate::ops::{
     apply_calculate, apply_dedupe, apply_full_join, apply_lookup_subtract, apply_pivot,
-    apply_side_by_side_blocks, apply_side_by_side_columns, apply_side_by_side_layout, apply_sort,
-    apply_vlookup_multi,
-    formulas_table_ids, resolve_calc_columns,
+    apply_row_to_col, apply_side_by_side_blocks, apply_side_by_side_columns,
+    apply_side_by_side_layout, apply_sort, apply_vlookup_multi, formulas_table_ids,
+    resolve_calc_columns,
 };
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -49,6 +49,7 @@ pub fn op_table_ids(op: &Operation) -> Vec<String> {
     match op {
         Operation::Filter { input_table_id, .. }
         | Operation::Pivot { input_table_id, .. }
+        | Operation::RowToCol { input_table_id, .. }
         | Operation::Sort { input_table_id, .. }
         | Operation::Dedupe { input_table_id, .. } => vec![input_table_id.clone()],
         Operation::Calculate {
@@ -448,6 +449,23 @@ impl Runtime {
                 let input = self.get_table(input_table_id)?;
                 apply_pivot(input, row_fields, value_fields, value_field, aggregation)
                     .map_err(|e| format!("步骤「{}」: {e}", step.name))
+            }
+            Operation::RowToCol {
+                input_table_id,
+                row_fields,
+                column_field,
+                value_field,
+                aggregation,
+            } => {
+                let input = self.get_table(input_table_id)?;
+                apply_row_to_col(
+                    input,
+                    row_fields,
+                    column_field,
+                    value_field,
+                    aggregation,
+                )
+                .map_err(|e| format!("步骤「{}」: {e}", step.name))
             }
             Operation::Calculate {
                 base_table_id,

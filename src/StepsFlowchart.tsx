@@ -146,6 +146,7 @@ const VALID_STEP_DRAG_TYPES = new Set<Step["operation"]["type"]>([
   "start",
   "filter",
   "pivot",
+  "rowToCol",
   "calculate",
   "sort",
   "dedupe",
@@ -1216,6 +1217,8 @@ function FlowCanvasInner({
   const [viewport, setViewport] = useState<Viewport>({ x: 0, y: 0, zoom: 1 });
   /** 连线拖拽/改接中：禁止用 props 重刷 nodes/edges，否则拖终点箭头会把画面清空 */
   const edgeGestureLockRef = useRef(false);
+  /** 节点拖拽中：禁止用旧 flowPositions 全量重刷，否则节点会跳回/像消失 */
+  const nodeDragLockRef = useRef(false);
   const edgeSpecsRef = useRef<FlowEdgeSpec[]>([]);
   const pathEdgeIdsRef = useRef<Set<string> | null>(null);
   const unlockTimerRef = useRef<number | null>(null);
@@ -1223,7 +1226,10 @@ function FlowCanvasInner({
   /** 正在改接的边（用于开始→源表虚线校验与提示） */
   const reconnectingEdgeRef = useRef<Edge | null>(null);
   const flowPositionsRef = useRef(flowPositions);
-  flowPositionsRef.current = flowPositions;
+  // 拖拽中勿用 props 覆盖本地乐观坐标，否则松手同步会读到旧位置
+  if (!nodeDragLockRef.current) {
+    flowPositionsRef.current = flowPositions;
+  }
   const onPositionsChangeRef = useRef(onPositionsChange);
   onPositionsChangeRef.current = onPositionsChange;
 
@@ -1241,12 +1247,23 @@ function FlowCanvasInner({
       ...flowPositionsRef.current,
     };
     for (const n of list) {
+      const x = n.position?.x;
+      const y = n.position?.y;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
       next[n.id] = {
-        x: Math.round(n.position.x),
-        y: Math.round(n.position.y),
+        x: Math.round(x),
+        y: Math.round(y),
       };
     }
     if (flowPositionsEqual(next, flowPositionsRef.current)) return;
+    // 先本地乐观更新，避免松手后同步仍读到拖拽前的坐标
+    flowPositionsRef.current = next;
+    if (syncPayloadRef.current) {
+      syncPayloadRef.current = {
+        ...syncPayloadRef.current,
+        flowPositions: next,
+      };
+    }
     onPositionsChangeRef.current(next);
   }, [getNodes]);
 
@@ -1482,6 +1499,11 @@ function FlowCanvasInner({
   );
 
   useEffect(() => {
+    // 节点拖拽中：只记 pending，不重刷位置（否则会跳回旧坐标，看起来像消失）
+    if (nodeDragLockRef.current) {
+      pendingNodeSyncRef.current = true;
+      return;
+    }
     // 改接终点时 RF 会临时拆边；此时用 props 全量重刷会清空画布。
     // 但「新增」节点仍要立刻补上，否则拖入步骤会丢。
     if (edgeGestureLockRef.current) {
@@ -1532,18 +1554,38 @@ function FlowCanvasInner({
 
   const handleNodesChange: OnNodesChange<FlowNode> = useCallback(
     (changes) => {
-      onNodesChange(changes);
+      // 忽略 RF 的 remove：只通过 onNodesDelete → 改方案 → sync 删除。
+      // 否则会出现「画布节点没了，方案里步骤还在」的幽灵丢失。
+      const next = changes.filter((ch) => ch.type !== "remove");
+      if (next.length) onNodesChange(next);
     },
     [onNodesChange],
   );
 
-  const onNodeDragStop: OnNodeDrag<FlowNode> = useCallback(() => {
+  const beginNodeDrag = useCallback(() => {
+    nodeDragLockRef.current = true;
+  }, []);
+
+  const endNodeDrag = useCallback(() => {
     flushPositions();
-  }, [flushPositions]);
+    nodeDragLockRef.current = false;
+    if (pendingNodeSyncRef.current) {
+      pendingNodeSyncRef.current = false;
+      if (!edgeGestureLockRef.current) flushFlowSync();
+    }
+  }, [flushPositions, flushFlowSync]);
+
+  const onNodeDragStart: OnNodeDrag<FlowNode> = useCallback(() => {
+    beginNodeDrag();
+  }, [beginNodeDrag]);
+
+  const onNodeDragStop: OnNodeDrag<FlowNode> = useCallback(() => {
+    endNodeDrag();
+  }, [endNodeDrag]);
 
   const onSelectionDragStop = useCallback(() => {
-    flushPositions();
-  }, [flushPositions]);
+    endNodeDrag();
+  }, [endNodeDrag]);
 
   const onNodesDelete = useCallback(
     (deleted: FlowNode[]) => {
@@ -1842,7 +1884,9 @@ function FlowCanvasInner({
       selectionKeyCode={["Control", "Meta"]}
       multiSelectionKeyCode={["Meta", "Control"]}
       reconnectRadius={24}
+      onNodeDragStart={onNodeDragStart}
       onNodeDragStop={onNodeDragStop}
+      onSelectionDragStart={beginNodeDrag}
       onSelectionDragStop={onSelectionDragStop}
       onNodesDelete={onNodesDelete}
       isValidConnection={isValidConnection}

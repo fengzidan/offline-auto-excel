@@ -91,6 +91,7 @@ export function stepInputIds(op: Operation): string[] {
   switch (op.type) {
     case "filter":
     case "pivot":
+    case "rowToCol":
     case "sort":
     case "dedupe":
       return op.inputTableId ? [op.inputTableId] : [];
@@ -422,6 +423,7 @@ export function applyFlowLink(op: Operation, tableId: string): Operation {
   switch (op.type) {
     case "filter":
     case "pivot":
+    case "rowToCol":
     case "sort":
     case "dedupe":
       return { ...op, inputTableId: tid };
@@ -506,6 +508,7 @@ export function applyFlowUnlink(op: Operation, tableId: string): Operation {
   switch (op.type) {
     case "filter":
     case "pivot":
+    case "rowToCol":
     case "sort":
     case "dedupe":
       return op.inputTableId === tid ? { ...op, inputTableId: "" } : op;
@@ -631,6 +634,8 @@ export function opLabel(op: Operation): string {
       return "筛选";
     case "pivot":
       return "透视";
+    case "rowToCol":
+      return "行转列";
     case "calculate":
       return "计算";
     case "sort":
@@ -658,6 +663,8 @@ export function opAccent(type: Operation["type"]): string {
       return "#2f6fed";
     case "pivot":
       return "#c45c26";
+    case "rowToCol":
+      return "#d97706";
     case "calculate":
       return "#0f7b6c";
     case "sort":
